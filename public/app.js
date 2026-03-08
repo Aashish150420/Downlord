@@ -28,6 +28,7 @@
   const progressFill = document.getElementById('progress-fill');
   const progressText = document.getElementById('progress-text');
   const progressStatus = document.getElementById('progress-status');
+  const downloadLabelEl = document.querySelector('.download-label');
   const tabs = document.querySelectorAll('.tab');
   const tabContents = document.querySelectorAll('.tab-content');
   const historyList = document.getElementById('history-list');
@@ -51,6 +52,7 @@
   const spotifyCandidatesSection = document.getElementById('spotify-candidates');
   const spotifyCandidateSelect = document.getElementById('spotify-candidate-select');
   const spotifyCustomUrlInput = document.getElementById('spotify-custom-url');
+  const spotifyCustomRow = document.querySelector('.spotify-custom-row');
   const queueList = document.getElementById('queue-list');
   const queueEmpty = document.getElementById('queue-empty');
   const queueCountEl = document.getElementById('queue-count');
@@ -323,7 +325,7 @@
   async function loadSpotifyCandidates(url, info) {
     if (!spotifyCandidatesSection || !spotifyCandidateSelect) return;
     spotifyCandidatesSection.classList.add('hidden');
-    spotifyCandidateSelect.innerHTML = '<option value=\"\">Auto (best match)</option>';
+    spotifyCandidateSelect.innerHTML = '<option value=\"\">🔍 Auto</option>';
     currentSpotifyCandidates = [];
 
     try {
@@ -348,6 +350,7 @@
       if (list.length) {
         spotifyCandidatesSection.classList.remove('hidden');
       }
+      updateSpotifyCustomUrlVisibility();
     } catch (e) {
       showToast(e.message, 'error');
     }
@@ -381,8 +384,9 @@
     if (site !== 'youtube') subtitlesCb.checked = false;
     watermarkLabel.classList.toggle('hidden', site !== 'tiktok');
     if (site !== 'tiktok') watermarkCb.checked = false;
-    playlistLabel.classList.toggle('hidden', site !== 'youtube');
-    if (site !== 'youtube') playlistCb.checked = false;
+    const showPlaylist = site === 'youtube' || site === 'spotify';
+    playlistLabel.classList.toggle('hidden', !showPlaylist);
+    if (!showPlaylist) playlistCb.checked = false;
   }
 
   formatBtns.forEach((btn) => {
@@ -397,6 +401,17 @@
   subtitlesCb.addEventListener('change', () => {
     if (currentInfo) updateOptionsVisibility(currentInfo.site);
   });
+
+  function updateSpotifyCustomUrlVisibility() {
+    if (!spotifyCandidateSelect || !spotifyCustomRow) return;
+    const isAuto = !spotifyCandidateSelect.value;
+    spotifyCustomRow.classList.toggle('hidden-row', isAuto);
+  }
+
+  if (spotifyCandidateSelect) {
+    spotifyCandidateSelect.addEventListener('change', updateSpotifyCustomUrlVisibility);
+    updateSpotifyCustomUrlVisibility();
+  }
 
   /* ========== Download ========== */
   downloadBtn.addEventListener('click', startDownload);
@@ -444,10 +459,11 @@
     const limitRate = limitRateSelect?.value || '';
 
     downloadBtn.disabled = true;
-    progressContainer.classList.remove('hidden');
-    progressFill.style.width = '0%';
-    progressText.textContent = '0%';
-    if (progressStatus) progressStatus.textContent = 'Preparing…';
+    downloadBtn.classList.add('downloading');
+    downloadBtn.classList.remove('done');
+    downloadBtn.style.setProperty('--progress', '0%');
+    if (progressStatus) progressStatus.textContent = 'Downloading... 0%';
+    if (progressText) progressText.textContent = '0%';
 
     downloadQueue = urls.map((_, i) => ({
       id: Date.now() + i,
@@ -505,9 +521,9 @@
             const data = JSON.parse(line.slice(6));
             if (data.type === 'progress') {
               const pct = Math.round(data.percent);
-              progressFill.style.width = pct + '%';
-              progressText.textContent = pct + '%';
-              if (progressStatus) progressStatus.textContent = 'Downloading…';
+              downloadBtn.style.setProperty('--progress', pct + '%');
+              if (progressText) progressText.textContent = pct + '%';
+              if (progressStatus) progressStatus.textContent = `Downloading... ${pct}%`;
               if (downloadQueue[currentIndex]) {
                 downloadQueue[currentIndex].percent = pct;
                 downloadQueue[currentIndex].status = 'downloading';
@@ -523,8 +539,8 @@
               if (currentIndex < downloadQueue.length) {
                 downloadQueue[currentIndex].status = 'downloading';
                 downloadQueue[currentIndex].percent = 0;
-                progressFill.style.width = '0%';
-                progressText.textContent = '0%';
+                downloadBtn.style.setProperty('--progress', '0%');
+                if (progressText) progressText.textContent = '0%';
               }
               renderQueue();
               updateQueueBadge();
@@ -538,9 +554,19 @@
         }
       }
 
-      if (progressStatus) progressStatus.textContent = 'Complete';
+      downloadBtn.classList.remove('downloading');
+      downloadBtn.classList.add('done');
+      downloadBtn.style.setProperty('--progress', '100%');
+      if (downloadLabelEl) downloadLabelEl.textContent = '✓ Done';
+      if (progressStatus) progressStatus.textContent = '';
+      if (progressText) progressText.textContent = '';
       showToast(downloadQueue.length > 1 ? 'All downloads complete' : 'Download complete', 'success');
       loadHistory();
+      setTimeout(() => {
+        downloadBtn.classList.remove('done');
+        downloadBtn.style.setProperty('--progress', '0%');
+        if (downloadLabelEl) downloadLabelEl.textContent = 'Download';
+      }, 3000);
       try {
         if ('Notification' in window) {
           if (Notification.permission === 'granted') {
@@ -555,8 +581,9 @@
         }
       } catch (_) {}
     } catch (err) {
+      downloadBtn.classList.remove('downloading');
       if (progressStatus) progressStatus.textContent = 'Failed';
-      progressText.textContent = '—';
+      if (progressText) progressText.textContent = '—';
       showError(err.message);
       showToast(err.message || 'Download failed', 'error');
       if (downloadQueue[currentIndex]) {
