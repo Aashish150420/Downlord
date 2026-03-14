@@ -46,6 +46,10 @@ function classifyYtDlpError(stderr = "") {
     return "The selected quality is not available for this video. Try Best or a lower resolution.";
   }
 
+  if (/no such option:\s*--no-watermark/.test(text)) {
+    return "TikTok download failed because the installed yt-dlp does not support a no-watermark flag. Retry with No watermark disabled.";
+  }
+
   if (
     /private video|members-only|login required|sign in to confirm/.test(text)
   ) {
@@ -1096,6 +1100,38 @@ function listRecentFiles(dir, startedAt, allowedExts) {
   }
 }
 
+function listFilesByExtNewestFirst(dir, allowedExts) {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((file) => {
+        if (!file || file.startsWith(".") || file === ".gitkeep") return false;
+        const fullPath = path.join(dir, file);
+        if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+          return false;
+        }
+        return allowedExts.includes(path.extname(file).toLowerCase());
+      })
+      .sort((a, b) => {
+        const statA = fs.statSync(path.join(dir, a));
+        const statB = fs.statSync(path.join(dir, b));
+        return statB.mtimeMs - statA.mtimeMs;
+      });
+  } catch {
+    return [];
+  }
+}
+
+function isExistingFile(dir, file) {
+  if (!file) return false;
+  try {
+    const stat = fs.statSync(path.join(dir, file));
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
 function normalizeMediaBaseName(value) {
   return String(value || "")
     .toLowerCase()
@@ -1356,7 +1392,11 @@ function downloadWithYtDlp({
 
     // TikTok watermark removal
     if (removeWatermark && site === "tiktok") {
-      args.push("--no-watermark");
+      // Standard yt-dlp does not support a global --no-watermark flag.
+      // Keep downloads working by ignoring this toggle when unsupported.
+      console.warn(
+        "[yt-dlp] No-watermark option requested for TikTok, but the current yt-dlp build does not support a no-watermark flag. Continuing with standard download.",
+      );
     }
 
     // Time range download
@@ -1378,25 +1418,38 @@ function downloadWithYtDlp({
       cwd: dir,
     });
 
-    const progressRegex = /(\d+\.?\d*)%/;
     const downloadedFiles = [];
     const finalFiles = [];
     let lastPercent = 0;
     let stderrAll = "";
 
-    const emitProgressFromLine = (line) => {
-      const meta = parseProgressMeta(line);
-      if (meta.percent == null || !onProgress) return;
-
-      const percent = meta.percent;
-      if (percent >= lastPercent) {
-        lastPercent = percent;
-        onProgress(Math.min(100, percent), {
-          speed: meta.speed,
-          eta: meta.eta,
+    const emitProgress = (percent, meta = {}) => {
+      if (!onProgress || percent == null || Number.isNaN(percent)) return;
+      const bounded = Math.max(0, Math.min(100, percent));
+      if (bounded >= lastPercent) {
+        lastPercent = bounded;
+        onProgress(bounded, {
+          speed: meta.speed || null,
+          eta: meta.eta || null,
         });
       }
     };
+
+    const emitProgressFromLine = (line) => {
+      const meta = parseProgressMeta(line);
+      if (meta.percent != null) {
+        emitProgress(meta.percent, meta);
+        return;
+      }
+
+      if (/\[download\]\s+destination:/i.test(line)) {
+        emitProgress(2, meta);
+      } else if (/post-?process|merg|fixup|extractaudio/i.test(line)) {
+        emitProgress(92, meta);
+      }
+    };
+
+    emitProgress(1, {});
 
     proc.stdout.on("data", (data) => {
       const str = data.toString();
@@ -1409,12 +1462,37 @@ function downloadWithYtDlp({
           if (finalMatch) {
             finalFiles.push(path.basename(finalMatch[1].trim()));
           }
+
+          const destinationMatch = line.match(
+            /\[download\] Destination: (.+)/i,
+          );
+          if (destinationMatch) {
+            downloadedFiles.push(path.basename(destinationMatch[1].trim()));
+          }
+
+          const alreadyDownloadedMatch = line.match(
+            /\[download\]\s+(.+?)\s+has already been downloaded/i,
+          );
+          if (alreadyDownloadedMatch) {
+            downloadedFiles.push(
+              path.basename(
+                alreadyDownloadedMatch[1].trim().replace(/^"|"$/g, ""),
+              ),
+            );
+          }
+
+          const mergerMatch = line.match(/\[Merger\].*?"(.+?)"/i);
+          if (mergerMatch) {
+            downloadedFiles.push(path.basename(mergerMatch[1].trim()));
+          }
+
+          const extractMatch = line.match(
+            /\[ExtractAudio\]\s+Destination:\s+(.+)/i,
+          );
+          if (extractMatch) {
+            downloadedFiles.push(path.basename(extractMatch[1].trim()));
+          }
         });
-      // Also detect "[download] Destination: ..." for filename
-      const destMatch = str.match(/\[download\] Destination: (.+)/);
-      if (destMatch) {
-        downloadedFiles.push(path.basename(destMatch[1].trim()));
-      }
     });
 
     proc.stderr.on("data", (data) => {
@@ -1449,17 +1527,26 @@ function downloadWithYtDlp({
       const subtitleExts = [".srt", ".vtt", ".ass"];
 
       try {
-        let files = [...new Set(finalFiles.filter(Boolean))];
-        if (files.length === 0) {
-          files = isPlaylist
-            ? [...new Set(downloadedFiles)]
-            : listRecentFiles(dir, downloadStartedAt, mediaExts);
+        let files = listRecentFiles(dir, downloadStartedAt, mediaExts);
+        if (!files || files.length === 0) {
+          files = [...new Set(finalFiles.filter(Boolean))].filter((file) =>
+            isExistingFile(dir, file),
+          );
         }
         if (!files || files.length === 0) {
-          files = [...new Set(downloadedFiles)];
+          files = [...new Set(downloadedFiles.filter(Boolean))].filter((file) =>
+            isExistingFile(dir, file),
+          );
+        }
+        if (!files || files.length === 0) {
+          const newestMedia = listFilesByExtNewestFirst(dir, mediaExts);
+          files = isPlaylist
+            ? newestMedia.slice(0, 20)
+            : newestMedia.slice(0, 1);
         }
 
         if (format === "mp4" && files.length > 0) {
+          emitProgress(Math.max(lastPercent, 90), {});
           const videoExts = [".mp4", ".webm", ".mkv"];
           const subtitleFiles =
             subtitles && site === "youtube"
@@ -1467,9 +1554,13 @@ function downloadWithYtDlp({
               : [];
 
           const processedFiles = [];
-          for (const file of files) {
+          for (let index = 0; index < files.length; index++) {
+            const file = files[index];
             if (!videoExts.includes(path.extname(file).toLowerCase())) {
               processedFiles.push(file);
+              const stagedPercent =
+                90 + Math.round(((index + 1) / files.length) * 9);
+              emitProgress(Math.max(lastPercent, stagedPercent), {});
               continue;
             }
 
@@ -1485,9 +1576,14 @@ function downloadWithYtDlp({
               subtitleMode: resolvedSubtitleMode,
             });
             processedFiles.push(finalFile);
+            const stagedPercent =
+              90 + Math.round(((index + 1) / files.length) * 9);
+            emitProgress(Math.max(lastPercent, stagedPercent), {});
           }
           files = processedFiles;
         }
+
+        emitProgress(100, {});
 
         resolve(files);
       } catch (error) {

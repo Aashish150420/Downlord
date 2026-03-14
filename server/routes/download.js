@@ -83,42 +83,58 @@ router.post("/", async (req, res) => {
 
   try {
     await enqueue(async () => {
+      let completedCount = 0;
+      let failedCount = 0;
       for (let i = 0; i < urls.length; i++) {
         const url = urls[i];
         const itemTitle =
           Array.isArray(titles) && titles[i] ? titles[i] : title;
         const total = urls.length;
-        const filenames = await download({
-          url,
-          format,
-          quality,
-          audioBitrate: audioBitrate || undefined,
-          filenameTemplate: filenameTemplate || undefined,
-          subtitleLangs: subtitleLangs || undefined,
-          isPlaylist,
-          subtitles,
-          removeWatermark,
-          downloadDir: DOWNLOAD_DIR,
-          spotifyYoutubeUrl: spotifyYoutubeUrl || undefined,
-          embedSubtitles: !!embedSubtitles,
-          subtitleMode,
-          startTime: startTime || undefined,
-          endTime: endTime || undefined,
-          limitRate: limitRate || undefined,
-          onProgress: (percent, meta = {}) => {
-            const offset = total > 1 ? (i / total) * 100 : 0;
-            const scale = total > 1 ? 100 / total : 100;
-            sendEvent({
-              type: "progress",
-              percent: offset + (percent * scale) / 100,
-              itemPercent: Math.max(0, Math.min(100, percent || 0)),
-              itemIndex: i,
-              itemTotal: total,
-              speed: meta.speed || null,
-              eta: meta.eta || null,
-            });
-          },
-        });
+        let filenames = [];
+
+        try {
+          filenames = await download({
+            url,
+            format,
+            quality,
+            audioBitrate: audioBitrate || undefined,
+            filenameTemplate: filenameTemplate || undefined,
+            subtitleLangs: subtitleLangs || undefined,
+            isPlaylist,
+            subtitles,
+            removeWatermark,
+            downloadDir: DOWNLOAD_DIR,
+            spotifyYoutubeUrl: spotifyYoutubeUrl || undefined,
+            embedSubtitles: !!embedSubtitles,
+            subtitleMode,
+            startTime: startTime || undefined,
+            endTime: endTime || undefined,
+            limitRate: limitRate || undefined,
+            onProgress: (percent, meta = {}) => {
+              const offset = total > 1 ? (i / total) * 100 : 0;
+              const scale = total > 1 ? 100 / total : 100;
+              sendEvent({
+                type: "progress",
+                percent: offset + (percent * scale) / 100,
+                itemPercent: Math.max(0, Math.min(100, percent || 0)),
+                itemIndex: i,
+                itemTotal: total,
+                speed: meta.speed || null,
+                eta: meta.eta || null,
+              });
+            },
+          });
+        } catch (itemError) {
+          failedCount++;
+          sendEvent({
+            type: "item-error",
+            message: itemError.message || "Download failed",
+            itemIndex: i,
+            itemTotal: total,
+            url,
+          });
+          continue;
+        }
 
         const site = detectSite(url);
         const mediaExts = [
@@ -134,6 +150,7 @@ router.post("/", async (req, res) => {
         ];
 
         let mediaFound = 0;
+        let itemSucceeded = false;
         for (const filename of filenames) {
           const ext = path.extname(filename || "").toLowerCase();
           // Only treat audio/video files as completed downloads; skip sidecar subtitle/metadata files
@@ -143,8 +160,11 @@ router.post("/", async (req, res) => {
           const filePath = path.resolve(DOWNLOAD_DIR, filename);
           if (!fs.existsSync(filePath)) {
             sendEvent({
-              type: "error",
+              type: "item-error",
               message: `Download finished but output file is missing: ${filename}`,
+              itemIndex: i,
+              itemTotal: total,
+              url,
             });
             continue;
           }
@@ -152,51 +172,90 @@ router.post("/", async (req, res) => {
           const stat = fs.statSync(filePath);
           if (!stat.isFile() || stat.size <= 0) {
             sendEvent({
-              type: "error",
+              type: "item-error",
               message: `Downloaded file is empty or invalid: ${filename}`,
+              itemIndex: i,
+              itemTotal: total,
+              url,
             });
             continue;
           }
 
-          const checksum = await sha256File(filePath);
+          try {
+            const checksum = await sha256File(filePath);
 
-          addEntry(
-            {
-              title: itemTitle,
-              url,
-              format,
-              quality,
-              audioBitrate: audioBitrate || null,
-              filenameTemplate: filenameTemplate || null,
-              subtitleLangs: subtitleLangs || null,
-              site,
+            addEntry(
+              {
+                title: itemTitle,
+                url,
+                format,
+                quality,
+                audioBitrate: audioBitrate || null,
+                filenameTemplate: filenameTemplate || null,
+                subtitleLangs: subtitleLangs || null,
+                site,
+                filename,
+                subtitles,
+                subtitleMode,
+                removeWatermark,
+                isPlaylist,
+                checksum,
+                fileSize: stat.size,
+                status: "completed",
+              },
+              HISTORY_FILE,
+            );
+            sendEvent({
+              type: "done",
               filename,
-              subtitles,
-              subtitleMode,
-              removeWatermark,
-              isPlaylist,
               checksum,
               fileSize: stat.size,
-              status: "completed",
-            },
-            HISTORY_FILE,
-          );
-          sendEvent({ type: "done", filename, checksum, fileSize: stat.size });
+              itemIndex: i,
+              itemTotal: total,
+              url,
+            });
+            itemSucceeded = true;
+          } catch (postError) {
+            sendEvent({
+              type: "item-error",
+              message:
+                postError.message ||
+                `Post-processing failed for output file: ${filename}`,
+              itemIndex: i,
+              itemTotal: total,
+              url,
+            });
+          }
         }
 
-        if (mediaFound === 0) {
+        if (mediaFound === 0 || !itemSucceeded) {
+          failedCount++;
           // If yt-dlp succeeded but we couldn't identify the final media file,
           // send a clear error so the UI doesn't falsely show "complete".
-          sendEvent({
-            type: "error",
-            message: `Download finished but no media file was detected. Files: ${(filenames || []).join(", ") || "none"}`,
-          });
+          if (mediaFound === 0) {
+            sendEvent({
+              type: "item-error",
+              message: `Download finished but no media file was detected. Files: ${(filenames || []).join(", ") || "none"}`,
+              itemIndex: i,
+              itemTotal: total,
+              url,
+            });
+          }
+        } else {
+          completedCount++;
         }
       }
+
+      sendEvent({
+        type: "batch-complete",
+        itemTotal: urls.length,
+        completed: completedCount,
+        failed: failedCount,
+      });
     });
   } catch (err) {
     console.error("/api/download error:", err.message);
-    sendEvent({ type: "error", message: err.message });
+    sendEvent({ type: "error", message: err.message, fatal: true });
   } finally {
     res.end();
   }

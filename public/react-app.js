@@ -79,6 +79,29 @@ function makeToast(message, type = "info", link) {
   };
 }
 
+function parseBatchUrls(input) {
+  const text = String(input || "");
+  if (!text.trim()) return [];
+
+  const matcher = new RegExp(URL_PATTERN.source, "gi");
+  const urls = [];
+
+  text.split(/\r?\n/).forEach((line) => {
+    const matches = line.match(matcher);
+    if (matches && matches.length) {
+      matches.forEach((item) => urls.push(item.trim()));
+      return;
+    }
+
+    const candidate = line.trim();
+    if (candidate && isValidUrl(candidate)) {
+      urls.push(candidate);
+    }
+  });
+
+  return [...new Set(urls.filter(Boolean))];
+}
+
 const PREFERENCES_KEY = "fluxdl.preferences.v1";
 
 function loadPreferences() {
@@ -166,6 +189,7 @@ function App() {
   const spotifyMode = site === "spotify";
   const subtitlesSupported = site === "youtube";
   const embeddableSubtitles = subtitlesSupported && format === "mp4";
+  const showNoWatermarkOption = batchMode || site === "tiktok";
   const canOpenDownloads = isLocalHost && isWindowsClient;
 
   const queueStats = useMemo(() => {
@@ -196,6 +220,10 @@ function App() {
     Array.isArray(info?.availableQualities) && info.availableQualities.length
       ? info.availableQualities
       : ["best", "1440", "1080", "720", "360"];
+  const batchParsedUrls = useMemo(
+    () => (batchMode ? parseBatchUrls(batchInput) : []),
+    [batchMode, batchInput],
+  );
   const spotifySourceReady =
     !spotifyMode ||
     spotifyCandidatesLoading ||
@@ -203,7 +231,7 @@ function App() {
   const downloadDisabled =
     downloadState.running ||
     isFetching ||
-    (batchMode ? !batchInput.trim() : !info) ||
+    (batchMode ? batchParsedUrls.length === 0 : !info) ||
     !spotifySourceReady;
 
   useEffect(() => {
@@ -533,10 +561,7 @@ function App() {
     const resolvedUrls = overrides.urls
       ? overrides.urls
       : batchMode
-        ? batchInput
-            .split(/\n/)
-            .map((item) => item.trim())
-            .filter(Boolean)
+        ? parseBatchUrls(batchInput)
         : [url.trim()].filter(Boolean);
 
     const titles =
@@ -620,10 +645,21 @@ function App() {
           : undefined;
 
     const normalizedUrls = resolvedUrls.filter((item) => isValidUrl(item));
+    const invalidUrlCount = Math.max(
+      0,
+      resolvedUrls.length - normalizedUrls.length,
+    );
     if (normalizedUrls.length === 0) {
       setUrlError("No valid URLs found.");
       pushToast("No valid URLs found.", "error");
       return;
+    }
+
+    if (batchMode && invalidUrlCount > 0) {
+      pushToast(
+        `Skipped ${invalidUrlCount} invalid line${invalidUrlCount > 1 ? "s" : ""} in batch input.`,
+        "info",
+      );
     }
 
     const payload = {
@@ -672,6 +708,303 @@ function App() {
 
     let currentIndex = 0;
     const doneFiles = [];
+    let failedItems = 0;
+    let batchSummary = null;
+
+    const processSingleItemStream = async (singlePayload, itemIndex) => {
+      const controller = new AbortController();
+      activeDownloadControllerRef.current = controller;
+
+      const response = await fetch("/api/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(singlePayload),
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error("Download failed");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let itemCompleted = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
+
+        for (const chunk of chunks) {
+          if (!chunk.startsWith("data: ")) continue;
+          const payloadStr = chunk.slice(6);
+
+          let event;
+          try {
+            event = JSON.parse(payloadStr);
+          } catch {
+            continue;
+          }
+
+          if (event.type === "progress") {
+            const itemPct = Math.max(
+              0,
+              Math.min(
+                100,
+                Math.round(
+                  event.itemPercent != null
+                    ? event.itemPercent
+                    : event.percent || 0,
+                ),
+              ),
+            );
+            const overallPct = Math.max(
+              0,
+              Math.min(
+                100,
+                Math.round(
+                  ((itemIndex + itemPct / 100) / normalizedUrls.length) * 100,
+                ),
+              ),
+            );
+
+            setDownloadState((prev) => ({
+              ...prev,
+              percent: overallPct,
+              itemPercent: itemPct,
+              itemIndex,
+              itemTotal: normalizedUrls.length,
+              speed: event.speed || null,
+              eta: event.eta || null,
+              statusText:
+                normalizedUrls.length > 1
+                  ? `Processing ${itemIndex + 1} of ${normalizedUrls.length}`
+                  : "Processing…",
+            }));
+
+            if (queueLocal[itemIndex]) {
+              queueLocal[itemIndex] = {
+                ...queueLocal[itemIndex],
+                status: "downloading",
+                percent: itemPct,
+                speed: event.speed || null,
+                eta: event.eta || null,
+              };
+              setQueue([...queueLocal]);
+            }
+          } else if (event.type === "done") {
+            itemCompleted = true;
+            doneFiles.push(event.filename);
+            notifyDesktop("Download finished", event.filename || "File ready");
+
+            if (event.checksum) {
+              pushToast(
+                `Checksum verified (SHA-256): ${String(event.checksum).slice(0, 12)}…`,
+                "info",
+              );
+            }
+
+            if (isLocalHost) {
+              showReadyToast(event.filename, false);
+            } else {
+              await triggerFileDownload(event.filename);
+            }
+
+            if (queueLocal[itemIndex]) {
+              queueLocal[itemIndex] = {
+                ...queueLocal[itemIndex],
+                status: "done",
+                percent: 100,
+                speed: null,
+                eta: null,
+              };
+              setQueue([...queueLocal]);
+            }
+          } else if (event.type === "item-error") {
+            throw new Error(event.message || "Download failed");
+          } else if (event.type === "error") {
+            throw new Error(event.message || "Download failed");
+          }
+        }
+      }
+
+      if (!itemCompleted) {
+        throw new Error(
+          "Download finished without a completed output file event.",
+        );
+      }
+    };
+
+    if (batchMode && normalizedUrls.length > 1 && !overrides.urls) {
+      try {
+        for (
+          let itemIndex = 0;
+          itemIndex < normalizedUrls.length;
+          itemIndex++
+        ) {
+          if (queueLocal[itemIndex]) {
+            queueLocal[itemIndex] = {
+              ...queueLocal[itemIndex],
+              status: "downloading",
+              percent: 0,
+              speed: null,
+              eta: null,
+            };
+            setQueue([...queueLocal]);
+          }
+
+          setDownloadState((prev) => ({
+            ...prev,
+            itemIndex,
+            itemTotal: normalizedUrls.length,
+            itemPercent: 0,
+            speed: null,
+            eta: null,
+            statusText: `Processing ${itemIndex + 1} of ${normalizedUrls.length}`,
+          }));
+
+          const singlePayload = {
+            ...payload,
+            urls: undefined,
+            url: normalizedUrls[itemIndex],
+            title: titles[itemIndex] || "Unknown",
+            titles: undefined,
+          };
+
+          let succeeded = false;
+          for (let attempt = 0; attempt < 2 && !succeeded; attempt++) {
+            try {
+              await processSingleItemStream(singlePayload, itemIndex);
+              succeeded = true;
+            } catch (itemError) {
+              const message = String(itemError?.message || "Download failed");
+              const looksNetworkRelated = /network|failed to fetch|fetch/i.test(
+                message,
+              );
+              const canRetry = attempt === 0 && looksNetworkRelated;
+
+              if (canRetry) {
+                await new Promise((resolve) => setTimeout(resolve, 900));
+                continue;
+              }
+
+              failedItems += 1;
+              if (queueLocal[itemIndex]) {
+                queueLocal[itemIndex] = {
+                  ...queueLocal[itemIndex],
+                  status: "error",
+                  speed: null,
+                  eta: null,
+                };
+                setQueue([...queueLocal]);
+              }
+              pushToast(`Item ${itemIndex + 1} failed: ${message}`, "error");
+              break;
+            }
+          }
+
+          const completedItems = queueLocal.filter(
+            (item) => item.status === "done",
+          ).length;
+          const overallPct = Math.round(
+            ((completedItems + failedItems) / normalizedUrls.length) * 100,
+          );
+          setDownloadState((prev) => ({
+            ...prev,
+            percent: Math.max(prev.percent, Math.min(100, overallPct)),
+          }));
+        }
+
+        setDownloadState({
+          running: false,
+          percent: 100,
+          itemPercent: 100,
+          itemIndex: Math.max(0, normalizedUrls.length - 1),
+          itemTotal: normalizedUrls.length,
+          speed: null,
+          eta: null,
+          statusText: "Done",
+          done: true,
+        });
+
+        if (doneFiles.length === 0 && failedItems > 0) {
+          pushToast(
+            `Batch finished with ${failedItems} failed item${failedItems === 1 ? "" : "s"}.`,
+            "error",
+          );
+        } else if (failedItems > 0) {
+          pushToast(
+            `Batch finished: ${doneFiles.length} done, ${failedItems} failed.`,
+            "info",
+          );
+        } else if (doneFiles.length === 0) {
+          pushToast(
+            "Download finished but no file was returned by the server.",
+            "error",
+          );
+        } else {
+          pushToast("All downloads complete", "success");
+          notifyDesktop(
+            "All downloads complete",
+            `${doneFiles.length} files finished`,
+          );
+        }
+
+        await loadHistory();
+        setTimeout(() => {
+          setDownloadState({
+            running: false,
+            percent: 0,
+            itemPercent: 0,
+            itemIndex: 0,
+            itemTotal: 0,
+            speed: null,
+            eta: null,
+            statusText: "Ready",
+            done: false,
+          });
+        }, 2400);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          setDownloadState({
+            running: false,
+            percent: 0,
+            itemPercent: 0,
+            itemIndex: 0,
+            itemTotal: 0,
+            speed: null,
+            eta: null,
+            statusText: "Canceled",
+            done: false,
+          });
+          pushToast(
+            "Batch was canceled in UI. Current request may still finish on server.",
+            "info",
+          );
+          return;
+        }
+
+        setDownloadState({
+          running: false,
+          percent: 0,
+          itemPercent: 0,
+          itemIndex: 0,
+          itemTotal: 0,
+          speed: null,
+          eta: null,
+          statusText: "Failed",
+          done: false,
+        });
+        pushToast(error.message || "Batch download failed", "error");
+      } finally {
+        activeDownloadControllerRef.current = null;
+      }
+      return;
+    }
 
     try {
       const controller = new AbortController();
@@ -749,6 +1082,10 @@ function App() {
               setQueue([...queueLocal]);
             }
           } else if (event.type === "done") {
+            const doneItemIndex =
+              Number.isInteger(event.itemIndex) && event.itemIndex >= 0
+                ? event.itemIndex
+                : currentIndex;
             doneFiles.push(event.filename);
             notifyDesktop("Download finished", event.filename || "File ready");
 
@@ -765,9 +1102,9 @@ function App() {
               await triggerFileDownload(event.filename);
             }
 
-            if (queueLocal[currentIndex]) {
-              queueLocal[currentIndex] = {
-                ...queueLocal[currentIndex],
+            if (queueLocal[doneItemIndex]) {
+              queueLocal[doneItemIndex] = {
+                ...queueLocal[doneItemIndex],
                 status: "done",
                 percent: 100,
                 speed: null,
@@ -775,7 +1112,7 @@ function App() {
               };
             }
 
-            currentIndex += 1;
+            currentIndex = Math.max(currentIndex, doneItemIndex + 1);
             if (currentIndex < queueLocal.length) {
               queueLocal[currentIndex] = {
                 ...queueLocal[currentIndex],
@@ -794,7 +1131,58 @@ function App() {
             }
 
             setQueue([...queueLocal]);
+          } else if (event.type === "item-error") {
+            const failedItemIndex =
+              Number.isInteger(event.itemIndex) && event.itemIndex >= 0
+                ? event.itemIndex
+                : currentIndex;
+            failedItems += 1;
+
+            if (queueLocal[failedItemIndex]) {
+              queueLocal[failedItemIndex] = {
+                ...queueLocal[failedItemIndex],
+                status: "error",
+                speed: null,
+                eta: null,
+              };
+              setQueue([...queueLocal]);
+            }
+
+            pushToast(
+              `Item ${failedItemIndex + 1} failed: ${event.message || "Download failed"}`,
+              "error",
+            );
+
+            if (failedItemIndex >= currentIndex) {
+              currentIndex = failedItemIndex + 1;
+            }
+
+            if (currentIndex < queueLocal.length) {
+              queueLocal[currentIndex] = {
+                ...queueLocal[currentIndex],
+                status: "downloading",
+                percent: 0,
+              };
+              setQueue([...queueLocal]);
+              setDownloadState((prev) => ({
+                ...prev,
+                itemIndex: currentIndex,
+                itemTotal: event.itemTotal || normalizedUrls.length,
+                itemPercent: 0,
+                speed: null,
+                eta: null,
+                statusText:
+                  normalizedUrls.length > 1
+                    ? `Processing ${currentIndex + 1} of ${normalizedUrls.length}`
+                    : "Processing…",
+              }));
+            }
+          } else if (event.type === "batch-complete") {
+            batchSummary = event;
           } else if (event.type === "error") {
+            if (!event.fatal && Number.isInteger(event.itemIndex)) {
+              continue;
+            }
             throw new Error(event.message || "Download failed");
           }
         }
@@ -812,7 +1200,21 @@ function App() {
         done: true,
       });
 
-      if (doneFiles.length === 0) {
+      if (doneFiles.length === 0 && failedItems > 0) {
+        pushToast(
+          batchSummary
+            ? `Batch finished with ${batchSummary.failed} failed item${batchSummary.failed === 1 ? "" : "s"}.`
+            : `Batch finished with ${failedItems} failed item${failedItems === 1 ? "" : "s"}.`,
+          "error",
+        );
+      } else if (failedItems > 0) {
+        pushToast(
+          batchSummary
+            ? `Batch finished: ${batchSummary.completed} done, ${batchSummary.failed} failed.`
+            : `Batch finished: ${doneFiles.length} done, ${failedItems} failed.`,
+          "info",
+        );
+      } else if (doneFiles.length === 0) {
         pushToast(
           "Download finished but no file was returned by the server.",
           "error",
@@ -887,7 +1289,9 @@ function App() {
         statusText: "Failed",
         done: false,
       });
-      setUrlError(error.message || "Download failed");
+      if (!batchMode) {
+        setUrlError(error.message || "Download failed");
+      }
       pushToast(error.message || "Download failed", "error");
     } finally {
       activeDownloadControllerRef.current = null;
@@ -1162,31 +1566,41 @@ function App() {
                   <input
                     value=${url}
                     onInput=${(event) => setUrl(event.target.value)}
-                    onKeyDown=${(event) => event.key === "Enter" && fetchInfo()}
-                    placeholder="Paste video or playlist URL..."
+                    onKeyDown=${(event) =>
+                      !batchMode && event.key === "Enter" && fetchInfo()}
+                    placeholder=${batchMode
+                      ? "Batch mode enabled — add URLs in the batch list"
+                      : "Paste video or playlist URL..."}
+                    disabled=${batchMode}
                     className="h-12 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none ring-flux-500 placeholder:text-zinc-500 focus:ring-2"
                   />
                   <div className="flex gap-2">
                     <button
                       onClick=${tryPasteFromClipboard}
+                      disabled=${batchMode}
                       className="h-12 rounded-xl border border-zinc-700 bg-zinc-900 px-4 text-sm font-semibold text-zinc-200 hover:border-zinc-500"
                     >
                       Paste
                     </button>
                     <button
                       onClick=${() => fetchInfo()}
-                      disabled=${isFetching}
+                      disabled=${isFetching || batchMode}
                       className="h-12 rounded-xl bg-flux-500 px-5 text-sm font-semibold uppercase tracking-wider text-white hover:bg-flux-400 disabled:opacity-60"
                     >
                       ${isFetching ? "Loading…" : "Fetch"}
                     </button>
                   </div>
                 </div>
-                ${urlError
-                  ? html`<p className="text-sm text-rose-400">${urlError}</p>`
-                  : html`<p className="text-xs text-zinc-500">
-                      Drag a link here or paste with Ctrl+V · Enter to fetch
-                    </p>`}
+                ${batchMode
+                  ? html`<p className="text-xs text-zinc-500">
+                      Batch mode active · ${batchParsedUrls.length}
+                      URL${batchParsedUrls.length === 1 ? "" : "s"} ready.
+                    </p>`
+                  : urlError
+                    ? html`<p className="text-sm text-rose-400">${urlError}</p>`
+                    : html`<p className="text-xs text-zinc-500">
+                        Drag a link here or paste with Ctrl+V · Enter to fetch
+                      </p>`}
               </div>
             </div>
 
@@ -1494,6 +1908,7 @@ function App() {
                       onChange=${(event) => {
                         setBatchMode(event.target.checked);
                         if (event.target.checked) {
+                          setUrlError("");
                           setUrl("");
                           setInfo(null);
                         }
@@ -1678,7 +2093,7 @@ function App() {
                         )}
                       </div>
                     </div>`}
-                    ${site === "tiktok" &&
+                    ${showNoWatermarkOption &&
                     html`<label
                       className="flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200"
                     >
@@ -1689,7 +2104,9 @@ function App() {
                           setRemoveWatermark(event.target.checked)}
                         className="h-4 w-4 accent-flux-500"
                       />
-                      No watermark
+                      ${batchMode
+                        ? "No watermark (TikTok links only)"
+                        : "No watermark"}
                     </label>`}
                     ${(site === "youtube" || site === "spotify") &&
                     html`<label
