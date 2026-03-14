@@ -1,224 +1,133 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FluxDL — Fast Media Downloader</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-  <!-- Toast container -->
-  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FluxDL — Fast Media Downloader</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ["Inter", "system-ui", "sans-serif"],
+              mono: [
+                "JetBrains Mono",
+                "ui-monospace",
+                "SFMono-Regular",
+                "monospace",
+              ],
+            },
+            colors: {
+              flux: {
+                50: "#fff1f1",
+                100: "#ffd7d7",
+                200: "#ffb0b0",
+                300: "#ff8080",
+                400: "#ff4f4f",
+                500: "#ff3b3b",
+                600: "#e52626",
+                700: "#be1b1b",
+                800: "#9d1a1a",
+                900: "#821c1c",
+              },
+            },
+            boxShadow: {
+              panel: "0 20px 60px rgba(0,0,0,.35)",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      body {
+        background:
+          radial-gradient(
+            circle at top,
+            rgba(255, 59, 59, 0.14),
+            transparent 32%
+          ),
+          radial-gradient(
+            circle at 85% 15%,
+            rgba(255, 255, 255, 0.05),
+            transparent 22%
+          ),
+          linear-gradient(180deg, #090909 0%, #050505 100%);
+      }
 
-  <button type="button" id="theme-toggle" class="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
-    <span class="theme-icon">☀️</span>
-  </button>
+      [data-theme="light"] body {
+        background:
+          radial-gradient(
+            circle at top,
+            rgba(239, 68, 68, 0.14),
+            transparent 34%
+          ),
+          linear-gradient(180deg, #f6f7fb 0%, #eef1f6 100%);
+      }
 
-  <div class="app">
-    <header class="header">
-      <h1>Downlord</h1>
-      <p class="tagline">Sharp, fast, opinionated media downloads.</p>
-    </header>
+      [data-theme="light"] .rounded-3xl,
+      [data-theme="light"] .rounded-2xl,
+      [data-theme="light"] .rounded-xl,
+      [data-theme="light"] .rounded-lg {
+        background-color: rgba(255, 255, 255, 0.9) !important;
+        border-color: #d4d4d8 !important;
+      }
 
-    <nav class="tabs" role="tablist">
-      <button type="button" class="tab active" data-tab="download" role="tab">Download</button>
-      <button type="button" class="tab" data-tab="queue" role="tab">
-        Queue <span id="queue-count" class="tab-badge hidden">0</span>
-      </button>
-      <button type="button" class="tab" data-tab="history" role="tab">History</button>
-    </nav>
+      [data-theme="light"] [class*="bg-zinc-9"],
+      [data-theme="light"] [class*="bg-zinc-8"] {
+        background-color: rgba(255, 255, 255, 0.94) !important;
+      }
 
-    <!-- Download tab -->
-    <main class="tab-content active" id="download-tab" role="tabpanel">
-      <section class="hero-section" id="url-drop-zone">
-        <label class="hero-label" for="url-input">Paste link</label>
-        <div class="hero-input-wrap">
-          <div class="hero-input-shell">
-            <input
-              type="text"
-              id="url-input"
-              class="hero-input"
-              placeholder="Paste video or playlist URL..."
-              autocomplete="off"
-              aria-describedby="url-error empty-hint"
-            />
-            <button type="button" id="paste-btn" class="paste-icon" title="Paste from clipboard (Ctrl+V)" aria-label="Paste from clipboard">
-              📋
-            </button>
-          </div>
-          <div class="hero-actions">
-            <button type="button" id="fetch-btn" class="btn btn-primary hero-cta">
-              <span class="hero-cta-label">Fetch</span>
-            </button>
-          </div>
-        </div>
-        <div class="hero-meta">
-          <p class="hero-hint" id="empty-hint">Drag a link here or paste with Ctrl+V · Enter to fetch</p>
-          <div id="site-badge" class="site-badge hidden"></div>
-        </div>
-        <div id="url-error" class="error-message" aria-live="polite"></div>
-      </section>
+      [data-theme="light"] .text-zinc-100,
+      [data-theme="light"] .text-zinc-200,
+      [data-theme="light"] .text-zinc-300,
+      [data-theme="light"] .text-zinc-400,
+      [data-theme="light"] .text-zinc-500 {
+        color: #18181b !important;
+      }
 
-      <!-- Preview card (appears after fetch) -->
-      <section id="preview-card" class="preview-card hidden">
-        <div class="preview-media">
-          <img id="preview-thumbnail" src="" alt="" />
-          <span id="preview-duration" class="duration-badge"></span>
-        </div>
-        <div class="preview-info">
-          <h2 id="preview-title">—</h2>
-          <p id="preview-uploader" class="uploader">—</p>
-        </div>
-      </section>
+      [data-theme="light"] h1,
+      [data-theme="light"] h2,
+      [data-theme="light"] h3,
+      [data-theme="light"] strong,
+      [data-theme="light"] summary,
+      [data-theme="light"] label,
+      [data-theme="light"] p,
+      [data-theme="light"] span,
+      [data-theme="light"] a {
+        color: #18181b;
+      }
 
-      <!-- Options: desktop inline; on mobile opens as bottom sheet -->
-      <section class="options-section" id="options-section">
-        <button type="button" class="options-toggle-mobile" id="options-toggle-mobile" aria-expanded="false" aria-controls="options-inner">
-          Format & quality
-        </button>
-        <div class="options-inner" id="options-inner">
-          <div class="option-row">
-            <span class="option-label">Format</span>
-            <div class="format-toggle">
-              <button type="button" class="format-btn active" data-format="mp4">MP4</button>
-              <button type="button" class="format-btn" data-format="mp3">MP3</button>
-            </div>
-          </div>
-          <div class="option-row" id="quality-row">
-            <span class="option-label">Quality</span>
-            <select id="quality-select">
-              <option value="best">Best</option>
-              <option value="1440">1440p</option>
-              <option value="1080">1080p</option>
-              <option value="720">720p</option>
-              <option value="360">360p</option>
-            </select>
-          </div>
+      [data-theme="light"] button[class*="bg-zinc"],
+      [data-theme="light"] input,
+      [data-theme="light"] select,
+      [data-theme="light"] textarea {
+        color: #18181b !important;
+        background-color: rgba(255, 255, 255, 0.96) !important;
+      }
 
-          <details class="options-advanced">
-            <summary class="options-advanced-summary">⚙ Advanced</summary>
-            <div class="options-advanced-body">
-              <div class="batch-row">
-                <label class="checkbox-label">
-                  <input type="checkbox" id="batch-mode-cb" />
-                  <span>Batch (one URL per line)</span>
-                </label>
-              </div>
-              <textarea id="url-batch-input" class="url-batch-input hidden" placeholder="Paste multiple URLs, one per line..." rows="4"></textarea>
+      [data-theme="light"] [class*="border-zinc-"] {
+        border-color: #d4d4d8 !important;
+      }
 
-              <section id="spotify-candidates" class="spotify-candidates hidden">
-                <div class="option-row">
-                  <span class="option-label adv-label">Source</span>
-                  <select id="spotify-candidate-select">
-                    <option value="">🔍 Auto</option>
-                  </select>
-                </div>
-                <div class="option-row spotify-custom-row">
-                  <span class="option-label adv-label">Manual URL</span>
-                  <input id="spotify-custom-url" type="text" placeholder="https://www.youtube.com/watch?v=..." />
-                </div>
-              </section>
-
-              <div class="option-row" id="bitrate-row">
-                <span class="option-label">Bitrate</span>
-                <select id="bitrate-select">
-                  <option value="">Best</option>
-                  <option value="320">320 kbps</option>
-                  <option value="256">256 kbps</option>
-                  <option value="192">192 kbps</option>
-                  <option value="128">128 kbps</option>
-                </select>
-              </div>
-              <div class="option-row" id="subtitle-lang-row">
-                <span class="option-label">Subtitles</span>
-                <input type="text" id="subtitle-langs-input" placeholder="en, en-US" />
-              </div>
-              <div class="option-row" id="embed-subs-row">
-                <label class="checkbox-label">
-                  <input type="checkbox" id="embed-subs-cb" />
-                  <span>Embed subtitles into file (YouTube only)</span>
-                </label>
-              </div>
-              <div class="option-row" id="filename-row">
-                <span class="option-label">Filename</span>
-                <input type="text" id="filename-template-input" placeholder="%(title)s - %(uploader)s.%(ext)s" />
-              </div>
-              <div class="option-row" id="clip-row">
-                <span class="option-label">Clip (time range)</span>
-                <div class="clip-inputs">
-                  <input type="text" id="clip-start" placeholder="Start (e.g. 0:30)" />
-                  <span class="clip-separator">to</span>
-                  <input type="text" id="clip-end" placeholder="End (e.g. 3:45)" />
-                </div>
-              </div>
-              <div class="option-row" id="limit-row">
-                <span class="option-label">Speed limit</span>
-                <select id="limit-rate-select">
-                  <option value="">Unlimited</option>
-                  <option value="1M">1 MB/s</option>
-                  <option value="2M">2 MB/s</option>
-                  <option value="5M">5 MB/s</option>
-                </select>
-              </div>
-              <div class="option-row checkboxes">
-                <label class="checkbox-label" id="subtitles-label">
-                  <input type="checkbox" id="subtitles-cb" />
-                  <span>Subtitles</span>
-                </label>
-                <label class="checkbox-label hidden" id="watermark-label">
-                  <input type="checkbox" id="watermark-cb" />
-                  <span>No watermark</span>
-                </label>
-                <label class="checkbox-label hidden" id="playlist-label">
-                  <input type="checkbox" id="playlist-cb" />
-                  <span>Full playlist</span>
-                </label>
-              </div>
-            </div>
-          </details>
-        </div>
-      </section>
-
-      <section class="download-section">
-        <button type="button" id="download-btn" class="btn btn-download" disabled>
-          <span class="download-label">Download</span>
-          <span id="progress-status" class="progress-status">Ready</span>
-          <span id="progress-text" class="progress-text">0%</span>
-          <div id="progress-container" class="progress-container hidden">
-            <div class="progress-bar">
-              <div id="progress-fill" class="progress-fill"></div>
-            </div>
-          </div>
-        </button>
-      </section>
-    </main>
-
-    <!-- Queue tab -->
-    <main class="tab-content" id="queue-tab" role="tabpanel">
-      <div class="queue-header">
-        <h2>Download queue</h2>
-      </div>
-      <ul id="queue-list" class="queue-list">
-        <!-- Filled by JS -->
-      </ul>
-      <p id="queue-empty" class="empty-state">No downloads in queue. Start one from the Download tab.</p>
-    </main>
-
-    <!-- History tab -->
-    <main class="tab-content" id="history-tab" role="tabpanel">
-      <div class="history-header">
-        <h2>History</h2>
-        <button type="button" id="clear-history-btn" class="btn btn-ghost">Clear all</button>
-      </div>
-      <ul id="history-list" class="history-list"></ul>
-      <p id="history-empty" class="empty-state">No downloads yet.</p>
-    </main>
-  </div>
-
-  <div class="options-sheet-backdrop" id="options-sheet-backdrop" aria-hidden="true"></div>
-  <script src="app.js"></script>
-</body>
+      [data-theme="light"] input,
+      [data-theme="light"] select,
+      [data-theme="light"] textarea,
+      [data-theme="light"] button {
+        border-color: #d4d4d8 !important;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen text-zinc-100 antialiased">
+    <noscript>Please enable JavaScript to use FluxDL.</noscript>
+    <div id="root"></div>
+    <script type="module" src="react-app.js"></script>
+  </body>
 </html>

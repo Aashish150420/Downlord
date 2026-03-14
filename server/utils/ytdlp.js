@@ -4,18 +4,120 @@
  * Uses spotDL for Spotify URLs only.
  */
 
-const { spawn } = require('child_process');
-const path = require('path');
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+function classifyYtDlpError(stderr = "") {
+  const text = String(stderr || "").toLowerCase();
+  const trimmed = String(stderr || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (
+    /unable to download video subtitles.*429|video subtitles.*too many requests|http error 429.*subtitles/.test(
+      text,
+    )
+  ) {
+    return "Subtitle download was rate-limited by the source (HTTP 429). Select one available subtitle language or retry later.";
+  }
+
+  if (/drm|protected content|widevine|playready/.test(text)) {
+    return "This video appears to be DRM-protected and cannot be downloaded.";
+  }
+
+  if (
+    /not available in your country|geo[- ]?restricted|this content is not available in your region/.test(
+      text,
+    )
+  ) {
+    return "This video is geo-restricted and not available from your current region.";
+  }
+
+  if (
+    /unsupported url|invalid url|unable to extract|no video formats found|url could be a direct video link/.test(
+      text,
+    )
+  ) {
+    return "Invalid or unsupported URL. Please paste a direct supported media page URL.";
+  }
+
+  if (/requested format is not available|format not available/.test(text)) {
+    return "The selected quality is not available for this video. Try Best or a lower resolution.";
+  }
+
+  if (
+    /private video|members-only|login required|sign in to confirm/.test(text)
+  ) {
+    return "This video requires login or is private, so it cannot be downloaded here.";
+  }
+
+  if (trimmed) {
+    return `Download failed: ${trimmed.slice(0, 280)}`;
+  }
+
+  return "Download failed. The source may be unavailable or temporarily blocked.";
+}
+
+function parseProgressMeta(line = "") {
+  const percentMatch = line.match(/(\d+\.?\d*)%/);
+  const speedMatch = line.match(/\bat\s+([^\s]+(?:\s?i?b\/s|b\/s))/i);
+  const etaMatch = line.match(/\beta\s+([0-9:]+)/i);
+
+  return {
+    percent: percentMatch ? parseFloat(percentMatch[1]) : null,
+    speed: speedMatch ? speedMatch[1] : null,
+    eta: etaMatch ? etaMatch[1] : null,
+  };
+}
+
+function collectSubtitleLanguages(info = {}) {
+  const langs = new Set();
+  [info.subtitles, info.automatic_captions].forEach((group) => {
+    if (!group || typeof group !== "object") return;
+    Object.keys(group).forEach((lang) => {
+      if (lang && lang !== "live_chat") langs.add(lang);
+    });
+  });
+  return [...langs].sort((a, b) => a.localeCompare(b));
+}
+
+function collectAvailableQualities(info = {}) {
+  const heights = new Set();
+  const formats = Array.isArray(info.formats) ? info.formats : [];
+
+  formats.forEach((format) => {
+    if (!format || format.vcodec === "none") return;
+    if (typeof format.height === "number" && format.height > 0) {
+      heights.add(format.height);
+    }
+  });
+
+  return [
+    "best",
+    ...[...heights].sort((a, b) => b - a).map((height) => String(height)),
+  ];
+}
+
+function escapeFfmpegSubtitlePath(filePath) {
+  return String(filePath)
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/'/g, "\\'");
+}
 
 // Map URL patterns to site identifiers for badges and logic
 const SITE_PATTERNS = [
-  { pattern: /youtube\.com|youtu\.be/i, site: 'youtube' },
-  { pattern: /instagram\.com/i, site: 'instagram' },
-  { pattern: /tiktok\.com|vm\.tiktok/i, site: 'tiktok' },
-  { pattern: /(?:twitter|x)\.com/i, site: 'twitter' },
-  { pattern: /facebook\.com|fb\.watch|fb\.com/i, site: 'facebook' },
-  { pattern: /soundcloud\.com/i, site: 'soundcloud' },
-  { pattern: /spotify\.com/i, site: 'spotify' },
+  { pattern: /youtube\.com|youtu\.be/i, site: "youtube" },
+  { pattern: /instagram\.com/i, site: "instagram" },
+  { pattern: /tiktok\.com|vm\.tiktok/i, site: "tiktok" },
+  { pattern: /(?:twitter|x)\.com/i, site: "twitter" },
+  { pattern: /facebook\.com|fb\.watch|fb\.com/i, site: "facebook" },
+  { pattern: /soundcloud\.com/i, site: "soundcloud" },
+  { pattern: /spotify\.com/i, site: "spotify" },
 ];
 
 /**
@@ -24,23 +126,26 @@ const SITE_PATTERNS = [
  * @returns {string} - Site identifier (youtube, instagram, tiktok, etc.)
  */
 function detectSite(url) {
-  if (!url || typeof url !== 'string') return 'unknown';
+  if (!url || typeof url !== "string") return "unknown";
   for (const { pattern, site } of SITE_PATTERNS) {
     if (pattern.test(url)) return site;
   }
-  return 'unknown';
+  return "unknown";
 }
 
 /**
  * Normalize Spotify URL for oEmbed (requires full https://open.spotify.com/...)
  */
 function normalizeSpotifyUrl(url) {
-  if (!url || typeof url !== 'string') return url;
-  if (url.startsWith('https://open.spotify.com/')) return url;
-  if (url.startsWith('http://open.spotify.com/')) return url.replace('http://', 'https://');
-  if (url.startsWith('open.spotify.com/')) return 'https://' + url;
-  if (url.includes('spotify.com/')) {
-    const match = url.match(/spotify\.com\/(track|album|playlist|artist)\/([a-zA-Z0-9]+)/);
+  if (!url || typeof url !== "string") return url;
+  if (url.startsWith("https://open.spotify.com/")) return url;
+  if (url.startsWith("http://open.spotify.com/"))
+    return url.replace("http://", "https://");
+  if (url.startsWith("open.spotify.com/")) return "https://" + url;
+  if (url.includes("spotify.com/")) {
+    const match = url.match(
+      /spotify\.com\/(track|album|playlist|artist)\/([a-zA-Z0-9]+)/,
+    );
     if (match) return `https://open.spotify.com/${match[1]}/${match[2]}`;
   }
   return url;
@@ -57,26 +162,32 @@ async function getInfo(url, downloadDir) {
   const site = detectSite(url);
 
   // Spotify: fetch metadata via oEmbed API (no auth required)
-  if (site === 'spotify') {
+  if (site === "spotify") {
     const isPlaylist = /spotify\.com\/(playlist|album)/i.test(url);
     const normalizedUrl = normalizeSpotifyUrl(url);
     try {
-      const oembedUrl = 'https://open.spotify.com/oembed?url=' + encodeURIComponent(normalizedUrl);
-      console.log('[Spotify oEmbed] Fetching:', oembedUrl);
+      const oembedUrl =
+        "https://open.spotify.com/oembed?url=" +
+        encodeURIComponent(normalizedUrl);
+      console.log("[Spotify oEmbed] Fetching:", oembedUrl);
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(oembedUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
+        headers: { "User-Agent": "Mozilla/5.0" },
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
 
       const text = await res.text();
-      console.log('[Spotify oEmbed] Status:', res.status);
+      console.log("[Spotify oEmbed] Status:", res.status);
 
       if (!res.ok) {
-        console.error('[Spotify oEmbed] Failed:', res.status, text.slice(0, 300));
+        console.error(
+          "[Spotify oEmbed] Failed:",
+          res.status,
+          text.slice(0, 300),
+        );
         throw new Error(`oEmbed returned ${res.status}`);
       }
 
@@ -84,25 +195,25 @@ async function getInfo(url, downloadDir) {
         const data = JSON.parse(text);
         if (data && (data.title || data.thumbnail_url)) {
           return {
-            title: data.title || 'Spotify content',
+            title: data.title || "Spotify content",
             thumbnail: data.thumbnail_url || null,
             duration: null,
             uploader: data.author_name || data.provider_name || null,
-            site: 'spotify',
+            site: "spotify",
             isPlaylist,
             hasSubtitles: false,
           };
         }
       }
     } catch (e) {
-      console.error('[Spotify oEmbed]', e.message);
+      console.error("[Spotify oEmbed]", e.message);
     }
     return {
-      title: 'Spotify content',
+      title: "Spotify content",
       thumbnail: null,
       duration: null,
       uploader: null,
-      site: 'spotify',
+      site: "spotify",
       isPlaylist,
       hasSubtitles: false,
     };
@@ -110,53 +221,63 @@ async function getInfo(url, downloadDir) {
 
   // Use yt-dlp for all other sites
   return new Promise((resolve, reject) => {
-    const args = [
-      '--dump-json',
-      '--no-download',
-      '--no-warnings',
-      url,
-    ];
+    const fs = require("fs");
+    const dir = path.resolve(downloadDir);
+    const downloadStartedAt = Date.now();
+    const args = ["--dump-json", "--no-download", "--no-warnings", url];
 
-    const proc = spawn('yt-dlp', args, {
-      cwd: path.resolve(downloadDir),
+    const proc = spawn("yt-dlp", args, {
+      cwd: dir,
     });
 
-    let stdout = '';
-    let stderr = '';
+    let stdout = "";
+    let stderr = "";
 
-    proc.stdout.on('data', (data) => { stdout += data; });
-    proc.stderr.on('data', (data) => { stderr += data; });
+    proc.stdout.on("data", (data) => {
+      stdout += data;
+    });
+    proc.stderr.on("data", (data) => {
+      stderr += data;
+    });
 
-    proc.on('close', (code) => {
+    proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(stderr || 'Failed to fetch info'));
+        return reject(new Error(stderr || "Failed to fetch info"));
       }
 
       try {
         // Handle playlists: yt-dlp outputs one JSON object per line for playlists
-        const lines = stdout.trim().split('\n').filter(Boolean);
+        const lines = stdout.trim().split("\n").filter(Boolean);
         const first = lines[0] ? JSON.parse(lines[0]) : {};
-        const isPlaylist = first._type === 'playlist' || lines.length > 1;
-        const entry = isPlaylist && first.entries?.[0] ? first.entries[0] : first;
+        const isPlaylist = first._type === "playlist" || lines.length > 1;
+        const entry =
+          isPlaylist && first.entries?.[0] ? first.entries[0] : first;
         const info = entry || first;
 
         resolve({
-          title: info.title || 'Unknown',
+          title: info.title || "Unknown",
           thumbnail: info.thumbnail || info.thumbnails?.[0]?.url || null,
           duration: info.duration || null,
           uploader: info.uploader || info.creator || info.channel || null,
           site,
           isPlaylist,
-          hasSubtitles: site === 'youtube' && !!(info.subtitles && Object.keys(info.subtitles).length > 0) ||
-            !!(info.automatic_captions && Object.keys(info.automatic_captions).length > 0),
+          availableQualities: collectAvailableQualities(info),
+          subtitleLanguages: collectSubtitleLanguages(info),
+          hasSubtitles:
+            (site === "youtube" &&
+              !!(info.subtitles && Object.keys(info.subtitles).length > 0)) ||
+            !!(
+              info.automatic_captions &&
+              Object.keys(info.automatic_captions).length > 0
+            ),
           approxSize: info.filesize_approx || info.filesize || null,
         });
       } catch (err) {
-        reject(new Error('Failed to parse yt-dlp output'));
+        reject(new Error("Failed to parse yt-dlp output"));
       }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on("error", (err) => reject(err));
   });
 }
 
@@ -167,16 +288,23 @@ async function getInfo(url, downloadDir) {
  * @returns {string} - yt-dlp format selector
  */
 function buildFormatString(quality, format) {
-  if (format === 'mp3') {
-    return 'bestaudio/best';
+  if (format === "mp3") {
+    // Audio-only downloads; yt-dlp will extract and we control bitrate via FFmpegExtractAudio.
+    return "bestaudio/best";
   }
-  switch (quality) {
-    case '1440': return 'bestvideo[height<=1440]+bestaudio/best[height<=1440]';
-    case '1080': return 'bestvideo[height<=1080]+bestaudio/best[height<=1080]';
-    case '720': return 'bestvideo[height<=720]+bestaudio/best[height<=720]';
-    case '360': return 'bestvideo[height<=360]+bestaudio/best[height<=360]';
-    default: return 'bestvideo+bestaudio/best';
+
+  // Prefer the best available video stream up to the selected cap.
+  // We transcode the final result to H.264/AAC later for compatibility,
+  // so quality selection should focus on getting the highest-quality source.
+  const videoPart = (h) => (h ? `bestvideo*[height<=${h}]` : `bestvideo*`);
+  const fallback = (h) => (h ? `best[height<=${h}]/best` : `best`);
+
+  const numericQuality = Number.parseInt(quality, 10);
+  if (Number.isFinite(numericQuality) && numericQuality > 0) {
+    return `${videoPart(numericQuality)}+bestaudio/${fallback(numericQuality)}`;
   }
+
+  return `${videoPart(null)}+bestaudio/${fallback(null)}`;
 }
 
 /**
@@ -184,7 +312,7 @@ function buildFormatString(quality, format) {
  */
 const SAFE_TEMPLATE = /^[a-zA-Z0-9%(.)._\-\s]+$/;
 function sanitizeTemplate(template) {
-  if (!template || typeof template !== 'string') return null;
+  if (!template || typeof template !== "string") return null;
   const t = template.trim();
   return SAFE_TEMPLATE.test(t) ? t : null;
 }
@@ -218,6 +346,7 @@ async function download({
   downloadDir,
   spotifyYoutubeUrl,
   embedSubtitles,
+  subtitleMode,
   startTime,
   endTime,
   limitRate,
@@ -225,7 +354,7 @@ async function download({
 }) {
   const site = detectSite(url);
 
-  if (site === 'spotify') {
+  if (site === "spotify") {
     return downloadSpotifyViaYoutube({
       url,
       format,
@@ -237,6 +366,7 @@ async function download({
       spotifyYoutubeUrl,
       downloadDir,
       embedSubtitles,
+      subtitleMode,
       startTime,
       endTime,
       limitRate,
@@ -244,24 +374,63 @@ async function download({
     });
   }
 
-  return downloadWithYtDlp({
-    url,
-    format,
-    quality,
-    audioBitrate,
-    filenameTemplate,
-    subtitleLangs,
-    isPlaylist,
-    subtitles,
-    removeWatermark,
-    downloadDir,
-    site,
-    embedSubtitles,
-    startTime,
-    endTime,
-    limitRate,
-    onProgress,
-  });
+  try {
+    return await downloadWithYtDlp({
+      url,
+      format,
+      quality,
+      audioBitrate,
+      filenameTemplate,
+      subtitleLangs,
+      isPlaylist,
+      subtitles,
+      removeWatermark,
+      downloadDir,
+      site,
+      embedSubtitles,
+      subtitleMode,
+      startTime,
+      endTime,
+      limitRate,
+      onProgress,
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    const shouldRetryWithoutSubtitles =
+      subtitles &&
+      site === "youtube" &&
+      /subtitle download was rate-limited|unable to download video subtitles|http error 429/i.test(
+        message,
+      );
+
+    if (!shouldRetryWithoutSubtitles) {
+      throw error;
+    }
+
+    console.warn(
+      "[yt-dlp] Subtitle requests were rate-limited. Retrying without subtitles.",
+    );
+
+    return downloadWithYtDlp({
+      url,
+      format,
+      quality,
+      audioBitrate,
+      filenameTemplate,
+      subtitleLangs: undefined,
+      isPlaylist,
+      subtitles: false,
+      removeWatermark,
+      downloadDir,
+      site,
+      embedSubtitles: false,
+      subtitleMode: "separate",
+      startTime,
+      endTime,
+      limitRate,
+      onProgress,
+    });
+  }
 }
 
 /**
@@ -279,39 +448,43 @@ async function downloadSpotifyViaYoutube({
   spotifyYoutubeUrl,
   downloadDir,
   embedSubtitles,
+  subtitleMode,
   startTime,
   endTime,
   limitRate,
   onProgress,
 }) {
   if (isPlaylist) {
-    throw new Error('Spotify playlists are not supported in fallback mode. Use individual track URLs instead.');
+    throw new Error(
+      "Spotify playlists are not supported in fallback mode. Use individual track URLs instead.",
+    );
   }
 
-   // If user picked a specific YouTube URL in the UI, use it directly.
-   if (spotifyYoutubeUrl) {
-     return downloadWithYtDlp({
-       url: spotifyYoutubeUrl,
-       format,
-       quality,
-       audioBitrate,
-       filenameTemplate,
-       subtitleLangs,
-       isPlaylist: false,
-       subtitles: false,
-       removeWatermark: false,
-       downloadDir,
-       site: 'youtube',
-       embedSubtitles,
-       startTime,
-       endTime,
-       limitRate,
-       onProgress,
-     });
-   }
+  // If user picked a specific YouTube URL in the UI, use it directly.
+  if (spotifyYoutubeUrl) {
+    return downloadWithYtDlp({
+      url: spotifyYoutubeUrl,
+      format,
+      quality,
+      audioBitrate,
+      filenameTemplate,
+      subtitleLangs,
+      isPlaylist: false,
+      subtitles: false,
+      removeWatermark: false,
+      downloadDir,
+      site: "youtube",
+      embedSubtitles,
+      subtitleMode,
+      startTime,
+      endTime,
+      limitRate,
+      onProgress,
+    });
+  }
 
-  let query = '';
-  let spotifyTitle = '';
+  let query = "";
+  let spotifyTitle = "";
   let spotifyArtists = [];
   let spotifyDurationSec = null;
 
@@ -319,11 +492,13 @@ async function downloadSpotifyViaYoutube({
   try {
     const meta = await getSpotifyTrackMetadata(url);
     if (meta) {
-      spotifyTitle = meta.title || '';
+      spotifyTitle = meta.title || "";
       spotifyArtists = meta.artists || [];
       spotifyDurationSec = meta.durationSec || null;
       if (!query && meta.title) {
-        query = meta.artists?.length ? `${meta.title} ${meta.artists.join(' ')}` : meta.title;
+        query = meta.artists?.length
+          ? `${meta.title} ${meta.artists.join(" ")}`
+          : meta.title;
       }
     }
   } catch (_) {
@@ -335,7 +510,9 @@ async function downloadSpotifyViaYoutube({
   try {
     oembedInfo = await getInfo(url, downloadDir);
     if (!query && oembedInfo && oembedInfo.title) {
-      query = oembedInfo.uploader ? `${oembedInfo.title} ${oembedInfo.uploader}` : oembedInfo.title;
+      query = oembedInfo.uploader
+        ? `${oembedInfo.title} ${oembedInfo.uploader}`
+        : oembedInfo.title;
     }
   } catch (_) {
     // fall through – we will just search by normalized URL
@@ -346,8 +523,12 @@ async function downloadSpotifyViaYoutube({
     try {
       const bestUrl = await findBestYoutubeMatchForSpotify({
         query,
-        spotifyTitle: spotifyTitle || (oembedInfo && oembedInfo.title) || '',
-        spotifyArtists: spotifyArtists.length ? spotifyArtists : (oembedInfo && oembedInfo.uploader ? [oembedInfo.uploader] : []),
+        spotifyTitle: spotifyTitle || (oembedInfo && oembedInfo.title) || "",
+        spotifyArtists: spotifyArtists.length
+          ? spotifyArtists
+          : oembedInfo && oembedInfo.uploader
+            ? [oembedInfo.uploader]
+            : [],
         durationSec: spotifyDurationSec,
         downloadDir,
       });
@@ -363,12 +544,15 @@ async function downloadSpotifyViaYoutube({
           subtitles: false,
           removeWatermark: false,
           downloadDir,
-          site: 'youtube',
+          site: "youtube",
           onProgress,
         });
       }
     } catch (e) {
-      console.error('[Spotify fallback] YouTube search failed, falling back to ytsearch1:', e.message);
+      console.error(
+        "[Spotify fallback] YouTube search failed, falling back to ytsearch1:",
+        e.message,
+      );
     }
   }
 
@@ -386,8 +570,9 @@ async function downloadSpotifyViaYoutube({
     subtitles: false,
     removeWatermark: false,
     downloadDir,
-    site: 'youtube',
+    site: "youtube",
     embedSubtitles,
+    subtitleMode,
     startTime,
     endTime,
     limitRate,
@@ -399,46 +584,54 @@ async function downloadSpotifyViaYoutube({
  * Perform a YouTube search via yt-dlp and pick the best match for a Spotify track.
  * Uses text heuristics to avoid live/remix/cover versions when possible.
  */
-async function findBestYoutubeMatchForSpotify({ query, spotifyTitle, spotifyArtists, durationSec, downloadDir }) {
+async function findBestYoutubeMatchForSpotify({
+  query,
+  spotifyTitle,
+  spotifyArtists,
+  durationSec,
+  downloadDir,
+}) {
   const searchQuery = `ytsearch10:${query}`;
   return new Promise((resolve, reject) => {
-    const args = ['--dump-json', '--no-download', searchQuery];
-    const proc = spawn('yt-dlp', args, {
+    const args = ["--dump-json", "--no-download", searchQuery];
+    const proc = spawn("yt-dlp", args, {
       cwd: path.resolve(downloadDir),
     });
 
-    let stdout = '';
-    let stderr = '';
+    let stdout = "";
+    let stderr = "";
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout.on("data", (data) => {
       stdout += data.toString();
     });
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    proc.on('close', (code) => {
+    proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(stderr || 'yt-dlp search failed'));
+        return reject(new Error(stderr || "yt-dlp search failed"));
       }
       try {
-        const lines = stdout.trim().split('\n').filter(Boolean);
+        const lines = stdout.trim().split("\n").filter(Boolean);
         const results = lines.map((line) => JSON.parse(line));
         if (!results.length) return resolve(null);
 
-        const artistCombined = (spotifyArtists || []).join(' ');
+        const artistCombined = (spotifyArtists || []).join(" ");
         const artistNorm = normalizeForMatch(artistCombined);
         const hasStrongArtistCandidate =
           !!artistNorm &&
           results.some((r) => {
-            const ytTitle = normalizeForMatch(r.title || '');
-            const ytChannel = normalizeForMatch(r.uploader || r.channel || '');
-            return ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm);
+            const ytTitle = normalizeForMatch(r.title || "");
+            const ytChannel = normalizeForMatch(r.uploader || r.channel || "");
+            return (
+              ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm)
+            );
           });
 
         const best = scoreBestYoutubeResult(
           results,
-          spotifyTitle || '',
+          spotifyTitle || "",
           artistCombined,
           durationSec || null,
           hasStrongArtistCandidate,
@@ -449,7 +642,7 @@ async function findBestYoutubeMatchForSpotify({ query, spotifyTitle, spotifyArti
       }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on("error", (err) => reject(err));
   });
 }
 
@@ -458,14 +651,16 @@ async function findBestYoutubeMatchForSpotify({ query, spotifyTitle, spotifyArti
  */
 async function getSpotifyCandidates(url, downloadDir) {
   const site = detectSite(url);
-  if (site !== 'spotify') return [];
+  if (site !== "spotify") return [];
 
-  let query = '';
+  let query = "";
 
   try {
     const meta = await getSpotifyTrackMetadata(url);
     if (meta && meta.title) {
-      query = meta.artists?.length ? `${meta.title} ${meta.artists.join(' ')}` : meta.title;
+      query = meta.artists?.length
+        ? `${meta.title} ${meta.artists.join(" ")}`
+        : meta.title;
     }
   } catch (_) {}
 
@@ -482,39 +677,45 @@ async function getSpotifyCandidates(url, downloadDir) {
   const searchQuery = query ? `ytsearch10:${query}` : normalizedUrl;
 
   return new Promise((resolve, reject) => {
-    const args = ['--dump-json', '--no-download', searchQuery];
-    const proc = spawn('yt-dlp', args, {
+    const args = ["--dump-json", "--no-download", searchQuery];
+    const proc = spawn("yt-dlp", args, {
       cwd: path.resolve(downloadDir),
     });
 
-    let stdout = '';
-    let stderr = '';
+    let stdout = "";
+    let stderr = "";
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout.on("data", (data) => {
       stdout += data.toString();
     });
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    proc.on('close', (code) => {
+    proc.on("close", (code) => {
       try {
-        const lines = stdout.trim().split('\n').filter(Boolean);
+        const lines = stdout.trim().split("\n").filter(Boolean);
         const results = lines.map((line) => JSON.parse(line));
         const candidates = results.map((r) => ({
           url: r.webpage_url || r.url,
-          title: r.title || '',
-          uploader: r.uploader || r.channel || '',
+          title: r.title || "",
+          uploader: r.uploader || r.channel || "",
           duration: r.duration || null,
         }));
         if (candidates.length > 0) {
           // Even if yt-dlp exited with non-zero due to warnings, return whatever we parsed.
           if (code !== 0) {
-            console.warn('[Spotify candidates] yt-dlp exited with code', code, 'but parsed', candidates.length, 'results.');
+            console.warn(
+              "[Spotify candidates] yt-dlp exited with code",
+              code,
+              "but parsed",
+              candidates.length,
+              "results.",
+            );
           }
           resolve(candidates);
         } else if (code !== 0) {
-          reject(new Error(stderr || 'yt-dlp search failed'));
+          reject(new Error(stderr || "yt-dlp search failed"));
         } else {
           resolve([]);
         }
@@ -523,32 +724,48 @@ async function getSpotifyCandidates(url, downloadDir) {
       }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on("error", (err) => reject(err));
   });
 }
 
 function normalizeForMatch(str) {
-  if (!str) return '';
+  if (!str) return "";
   return str
     .toLowerCase()
-    .replace(/[\[\]\(\)\-_,\.]/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[\[\]\(\)\-_,\.]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-function scoreBestYoutubeResult(results, spotifyTitle, spotifyArtist, spotifyDurationSec, preferArtistStrict) {
+function scoreBestYoutubeResult(
+  results,
+  spotifyTitle,
+  spotifyArtist,
+  spotifyDurationSec,
+  preferArtistStrict,
+) {
   const titleNorm = normalizeForMatch(spotifyTitle);
   const artistNorm = normalizeForMatch(spotifyArtist);
-  const titleTokens = titleNorm.split(' ').filter(Boolean);
+  const titleTokens = titleNorm.split(" ").filter(Boolean);
 
-  const badWords = ['live', 'remix', 'slowed', 'speed up', 'sped up', '8d', 'cover', 'edit', 'version'];
+  const badWords = [
+    "live",
+    "remix",
+    "slowed",
+    "speed up",
+    "sped up",
+    "8d",
+    "cover",
+    "edit",
+    "version",
+  ];
 
   let best = null;
   let bestScore = -Infinity;
 
   for (const r of results) {
-    const ytTitle = normalizeForMatch(r.title || '');
-    const ytChannel = normalizeForMatch(r.uploader || r.channel || '');
+    const ytTitle = normalizeForMatch(r.title || "");
+    const ytChannel = normalizeForMatch(r.uploader || r.channel || "");
 
     let score = 0;
 
@@ -579,9 +796,11 @@ function scoreBestYoutubeResult(results, spotifyTitle, spotifyArtist, spotifyDur
       // Strongly reward matches close to the Spotify track duration
       if (spotifyDurationSec) {
         const diff = Math.abs(dur - spotifyDurationSec);
-        if (diff <= 3) score += 10;          // very close match
-        else if (diff <= 8) score += 6;      // reasonably close
-        else if (diff >= 20) score -= 6;     // way off
+        if (diff <= 3)
+          score += 10; // very close match
+        else if (diff <= 8)
+          score += 6; // reasonably close
+        else if (diff >= 20) score -= 6; // way off
       }
 
       // If we have at least one strong artist candidate, heavily penalize results
@@ -589,8 +808,7 @@ function scoreBestYoutubeResult(results, spotifyTitle, spotifyArtist, spotifyDur
       // very popular songs with the same title but different artist.
       if (preferArtistStrict && artistNorm) {
         const hasArtist =
-          ytTitle.includes(artistNorm) ||
-          ytChannel.includes(artistNorm);
+          ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm);
         if (!hasArtist) {
           score -= 20;
         }
@@ -620,53 +838,66 @@ async function getSpotifyTrackMetadata(url) {
   if (!clientId || !clientSecret) return null;
 
   try {
-    const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    const tokenRes = await fetch('https://accounts.spotify.com/api/token', {
-      method: 'POST',
+    const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+    const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        "Content-Type": "application/x-www-form-urlencoded",
         Authorization: `Basic ${basic}`,
       },
-      body: 'grant_type=client_credentials',
+      body: "grant_type=client_credentials",
     });
     if (!tokenRes.ok) {
       const text = await tokenRes.text();
-      console.error('[Spotify meta] token error', tokenRes.status, text.slice(0, 200));
+      console.error(
+        "[Spotify meta] token error",
+        tokenRes.status,
+        text.slice(0, 200),
+      );
       return null;
     }
     const tokenJson = await tokenRes.json();
     const accessToken = tokenJson.access_token;
     if (!accessToken) return null;
 
-    const trackRes = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
+    const trackRes = await fetch(
+      `https://api.spotify.com/v1/tracks/${trackId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
       },
-    });
+    );
     if (!trackRes.ok) {
       const text = await trackRes.text();
-      console.error('[Spotify meta] track error', trackRes.status, text.slice(0, 200));
+      console.error(
+        "[Spotify meta] track error",
+        trackRes.status,
+        text.slice(0, 200),
+      );
       return null;
     }
     const track = await trackRes.json();
     return {
-      title: track.name || '',
-      artists: Array.isArray(track.artists) ? track.artists.map((a) => a.name).filter(Boolean) : [],
+      title: track.name || "",
+      artists: Array.isArray(track.artists)
+        ? track.artists.map((a) => a.name).filter(Boolean)
+        : [],
       album: track.album?.name || null,
       durationSec: track.duration_ms ? track.duration_ms / 1000 : null,
     };
   } catch (e) {
-    console.error('[Spotify meta]', e.message);
+    console.error("[Spotify meta]", e.message);
     return null;
   }
 }
 
 /** List audio files in dir, sorted by mtime (newest first). Returns relative paths for API. */
 function listAudioFilesInDir(dir) {
-  const fs = require('fs');
-  const audioExts = ['.mp3', '.m4a', '.flac', '.opus', '.ogg', '.wav'];
+  const audioExts = [".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav"];
   try {
-    const files = fs.readdirSync(dir)
+    const files = fs
+      .readdirSync(dir)
       .filter((f) => audioExts.some((ext) => f.toLowerCase().endsWith(ext)));
     return files.sort((a, b) => {
       const statA = fs.statSync(path.join(dir, a));
@@ -675,6 +906,190 @@ function listAudioFilesInDir(dir) {
     });
   } catch {
     return [];
+  }
+}
+
+function listRecentFiles(dir, startedAt, allowedExts) {
+  try {
+    return fs.readdirSync(dir).filter((file) => {
+      if (file.startsWith(".") || file === ".gitkeep") return false;
+      const fullPath = path.join(dir, file);
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile()) return false;
+      if (stat.mtimeMs + 2000 < startedAt) return false;
+      return allowedExts.includes(path.extname(file).toLowerCase());
+    });
+  } catch {
+    return [];
+  }
+}
+
+function normalizeMediaBaseName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/['"`]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getSubtitleFilesForMedia(mediaFile, subtitleFiles) {
+  const baseName = path.parse(mediaFile).name;
+  const normalizedBase = normalizeMediaBaseName(baseName);
+  return subtitleFiles
+    .filter((file) => {
+      const nameWithoutExt = file.slice(0, -path.extname(file).length);
+      const normalizedCandidate = normalizeMediaBaseName(nameWithoutExt);
+      return (
+        nameWithoutExt === baseName ||
+        nameWithoutExt.startsWith(`${baseName}.`) ||
+        normalizedCandidate === normalizedBase ||
+        normalizedCandidate.startsWith(`${normalizedBase} `)
+      );
+    })
+    .sort();
+}
+
+function getSubtitleLanguage(filename) {
+  const match = filename.match(/\.([a-zA-Z-]+)\.(?:srt|vtt|ass)$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+function runProcess(command, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, { cwd });
+    let stderr = "";
+
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        return reject(
+          new Error(stderr || `${command} failed with exit code ${code}`),
+        );
+      }
+      resolve();
+    });
+
+    proc.on("error", reject);
+  });
+}
+
+async function ensureCompatibleMp4({
+  dir,
+  mediaFile,
+  subtitleFiles,
+  subtitleMode,
+}) {
+  const inputPath = path.join(dir, mediaFile);
+  const sourceExt = path.extname(mediaFile).toLowerCase();
+  const outputBaseName = path.parse(mediaFile).name;
+  const finalName = `${outputBaseName}.mp4`;
+  const finalPath = path.join(dir, finalName);
+  const tempName = `${outputBaseName}.compat-${Date.now()}.mp4`;
+  const tempPath = path.join(dir, tempName);
+  const args = ["-y", "-i", inputPath];
+
+  const resolvedSubtitleMode = subtitleMode || "separate";
+  const existingSubtitleFiles = (subtitleFiles || []).filter((file) =>
+    fs.existsSync(path.join(dir, file)),
+  );
+  const shouldSoftEmbed =
+    resolvedSubtitleMode === "soft" && existingSubtitleFiles.length > 0;
+  const shouldHardEmbed =
+    resolvedSubtitleMode === "hard" && existingSubtitleFiles.length > 0;
+  const needsVideoTranscode = true;
+  let hardBurnTempSubtitle = null;
+
+  if (shouldSoftEmbed) {
+    existingSubtitleFiles.forEach((subtitleFile) => {
+      args.push("-i", path.join(dir, subtitleFile));
+    });
+  }
+
+  args.push(
+    "-map_metadata",
+    "0",
+    "-map_chapters",
+    "0",
+    "-map",
+    "0:v?",
+    "-map",
+    "0:a?",
+  );
+
+  if (shouldSoftEmbed) {
+    existingSubtitleFiles.forEach((_, index) => {
+      args.push("-map", `${index + 1}:0`);
+    });
+  }
+
+  if (shouldHardEmbed) {
+    const sourceSubtitlePath = path.join(dir, existingSubtitleFiles[0]);
+    hardBurnTempSubtitle = path.join(
+      dir,
+      `__hardburn-${Date.now()}${path.extname(existingSubtitleFiles[0]) || ".srt"}`,
+    );
+    fs.copyFileSync(sourceSubtitlePath, hardBurnTempSubtitle);
+
+    args.push(
+      "-vf",
+      `subtitles='${escapeFfmpegSubtitlePath(hardBurnTempSubtitle)}'`,
+    );
+  }
+
+  args.push("-c:v", "libx264", "-preset", "medium", "-crf", "18");
+  args.push("-pix_fmt", "yuv420p");
+  args.push("-c:a", "aac", "-b:a", "192k", "-ac", "2");
+
+  if (shouldSoftEmbed) {
+    args.push("-c:s", "mov_text");
+    existingSubtitleFiles.forEach((subtitleFile, index) => {
+      const language = getSubtitleLanguage(subtitleFile);
+      if (language) {
+        args.push(`-metadata:s:s:${index}`, `language=${language}`);
+      }
+    });
+    args.push("-disposition:s:0", "default");
+  }
+
+  args.push("-movflags", "+faststart", tempPath);
+
+  try {
+    await runProcess("ffmpeg", args, dir);
+    if (hardBurnTempSubtitle) {
+      fs.rmSync(hardBurnTempSubtitle, { force: true });
+    }
+    if (inputPath !== finalPath) {
+      fs.rmSync(finalPath, { force: true });
+      fs.rmSync(inputPath, { force: true });
+      fs.renameSync(tempPath, finalPath);
+      return finalName;
+    }
+    fs.rmSync(inputPath, { force: true });
+    fs.renameSync(tempPath, inputPath);
+    return mediaFile;
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    if (hardBurnTempSubtitle) {
+      fs.rmSync(hardBurnTempSubtitle, { force: true });
+    }
+
+    if (shouldHardEmbed) {
+      console.warn(
+        "[ffmpeg] Hard-burn subtitles failed; retrying with soft subtitles.",
+      );
+      return ensureCompatibleMp4({
+        dir,
+        mediaFile,
+        subtitleFiles: existingSubtitleFiles,
+        subtitleMode: "soft",
+      });
+    }
+
+    throw error;
   }
 }
 
@@ -693,87 +1108,136 @@ function downloadWithYtDlp({
   removeWatermark,
   downloadDir,
   site,
-   embedSubtitles,
-   startTime,
-   endTime,
-   limitRate,
+  embedSubtitles,
+  subtitleMode,
+  startTime,
+  endTime,
+  limitRate,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
-    const baseTemplate = sanitizeTemplate(filenameTemplate) || '%(title)s - %(uploader)s.%(ext)s';
-    const outputTemplate = path.join(path.resolve(downloadDir), baseTemplate);
+    const dir = path.resolve(downloadDir);
+    const downloadStartedAt = Date.now();
+
+    const defaultTemplate = isPlaylist
+      ? "%(autonumber)03d - %(title)s - %(uploader)s.%(ext)s"
+      : "%(title)s - %(uploader)s.%(ext)s";
+    const baseTemplate = sanitizeTemplate(filenameTemplate) || defaultTemplate;
+    const outputTemplate = path.join(dir, baseTemplate);
+    const resolvedSubtitleMode =
+      subtitleMode || (embedSubtitles ? "soft" : "separate");
 
     const args = [
-      '-o', outputTemplate,
-      '--newline',
-      '--no-warnings',
+      "-o",
+      outputTemplate,
+      "--newline",
+      "--no-warnings",
+      "--print",
+      "after_move:__FINAL_FILE__:%(filepath)s",
+      // Keep partial files and continue them to support interrupted downloads.
+      "--continue",
+      "--part",
     ];
 
     // Format and quality
     const formatStr = buildFormatString(quality, format);
-    args.push('-f', formatStr);
+    args.push("-f", formatStr);
 
-    if (format === 'mp3') {
-      args.push('--extract-audio', '--audio-format', 'mp3');
+    // Force final container when user selected MP4
+    if (format === "mp4") {
+      args.push("--merge-output-format", "mp4");
+    }
+
+    if (format === "mp3") {
+      args.push("--extract-audio", "--audio-format", "mp3");
       if (audioBitrate) {
-        args.push('--postprocessor-args', `FFmpegExtractAudio:-b:a ${audioBitrate}k`);
+        args.push(
+          "--postprocessor-args",
+          `FFmpegExtractAudio:-b:a ${audioBitrate}k`,
+        );
       }
       // Embed thumbnail and metadata for nicer MP3s
-      args.push('--embed-thumbnail', '--embed-metadata');
+      args.push("--embed-thumbnail", "--embed-metadata");
     }
 
     // Playlist
     if (!isPlaylist) {
-      args.push('--no-playlist');
+      args.push("--no-playlist");
+    } else {
+      args.push("--yes-playlist");
     }
 
     // Subtitles (YouTube only)
-    if (subtitles && site === 'youtube') {
-      const langs = (subtitleLangs || 'en,en-US,en-GB').replace(/\s/g, '');
-      args.push('--write-subs', '--sub-langs', langs || 'en');
-      if (embedSubtitles) {
-        args.push('--embed-subs');
+    if (subtitles && site === "youtube") {
+      const langs = (subtitleLangs || "all").replace(/\s/g, "");
+      // Download both regular and automatic subtitles where available.
+      args.push(
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs",
+        langs || "all",
+      );
+      if (format !== "mp3") {
+        args.push("--convert-subs", "srt");
       }
     }
 
     // TikTok watermark removal
-    if (removeWatermark && site === 'tiktok') {
-      args.push('--no-watermark');
+    if (removeWatermark && site === "tiktok") {
+      args.push("--no-watermark");
     }
 
     // Time range download
-    const start = (startTime || '').trim();
-    const end = (endTime || '').trim();
+    const start = (startTime || "").trim();
+    const end = (endTime || "").trim();
     if (start || end) {
-      const section = `*${start || ''}-${end || ''}`;
-      args.push('--download-sections', section);
+      const section = `*${start || ""}-${end || ""}`;
+      args.push("--download-sections", section);
     }
 
     // Download speed limiter
     if (limitRate) {
-      args.push('--limit-rate', limitRate);
+      args.push("--limit-rate", limitRate);
     }
 
     args.push(url);
 
-    const proc = spawn('yt-dlp', args, {
-      cwd: path.resolve(downloadDir),
+    const proc = spawn("yt-dlp", args, {
+      cwd: dir,
     });
 
     const progressRegex = /(\d+\.?\d*)%/;
     const downloadedFiles = [];
+    const finalFiles = [];
     let lastPercent = 0;
+    let stderrAll = "";
 
-    proc.stdout.on('data', (data) => {
-      const str = data.toString();
-      const match = str.match(progressRegex);
-      if (match && onProgress) {
-        const percent = parseFloat(match[1]);
-        if (percent > lastPercent) {
-          lastPercent = percent;
-          onProgress(Math.min(100, percent));
-        }
+    const emitProgressFromLine = (line) => {
+      const meta = parseProgressMeta(line);
+      if (meta.percent == null || !onProgress) return;
+
+      const percent = meta.percent;
+      if (percent >= lastPercent) {
+        lastPercent = percent;
+        onProgress(Math.min(100, percent), {
+          speed: meta.speed,
+          eta: meta.eta,
+        });
       }
+    };
+
+    proc.stdout.on("data", (data) => {
+      const str = data.toString();
+      str
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .forEach((line) => {
+          emitProgressFromLine(line);
+          const finalMatch = line.match(/^__FINAL_FILE__:(.+)$/);
+          if (finalMatch) {
+            finalFiles.push(path.basename(finalMatch[1].trim()));
+          }
+        });
       // Also detect "[download] Destination: ..." for filename
       const destMatch = str.match(/\[download\] Destination: (.+)/);
       if (destMatch) {
@@ -781,36 +1245,85 @@ function downloadWithYtDlp({
       }
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on("data", (data) => {
       const str = data.toString();
-      const match = str.match(progressRegex);
-      if (match && onProgress) {
-        const percent = parseFloat(match[1]);
-        if (percent > lastPercent) {
-          lastPercent = percent;
-          onProgress(Math.min(100, percent));
-        }
-      }
+      stderrAll += str;
+      str
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .forEach((line) => emitProgressFromLine(line));
     });
 
-    proc.on('close', (code) => {
+    proc.on("close", async (code) => {
       if (code !== 0) {
-        return reject(new Error('yt-dlp download failed'));
+        const friendly = classifyYtDlpError(stderrAll);
+        return reject(new Error(friendly));
       }
 
-      // If we didn't capture from stdout, list download dir
-      const fs = require('fs');
-      const dir = path.resolve(downloadDir);
-      const files = downloadedFiles.length > 0
-        ? downloadedFiles
-        : fs.readdirSync(dir)
-            .filter(f => !f.startsWith('.') && f !== '.gitkeep')
-            .map(f => f);
+      // Prefer to infer final media files by modification time rather than
+      // relying on stdout, which may list temporary fragments that yt-dlp
+      // deletes after merging.
+      const mediaExts = [
+        ".mp4",
+        ".webm",
+        ".mkv",
+        ".mp3",
+        ".m4a",
+        ".flac",
+        ".opus",
+        ".ogg",
+        ".wav",
+      ];
+      const subtitleExts = [".srt", ".vtt", ".ass"];
 
-      resolve(files);
+      try {
+        let files = [...new Set(finalFiles.filter(Boolean))];
+        if (files.length === 0) {
+          files = isPlaylist
+            ? [...new Set(downloadedFiles)]
+            : listRecentFiles(dir, downloadStartedAt, mediaExts);
+        }
+        if (!files || files.length === 0) {
+          files = [...new Set(downloadedFiles)];
+        }
+
+        if (format === "mp4" && files.length > 0) {
+          const videoExts = [".mp4", ".webm", ".mkv"];
+          const subtitleFiles =
+            subtitles && site === "youtube"
+              ? listRecentFiles(dir, downloadStartedAt, subtitleExts)
+              : [];
+
+          const processedFiles = [];
+          for (const file of files) {
+            if (!videoExts.includes(path.extname(file).toLowerCase())) {
+              processedFiles.push(file);
+              continue;
+            }
+
+            const matchedSubtitleFiles =
+              resolvedSubtitleMode !== "separate"
+                ? getSubtitleFilesForMedia(file, subtitleFiles)
+                : [];
+
+            const finalFile = await ensureCompatibleMp4({
+              dir,
+              mediaFile: file,
+              subtitleFiles: matchedSubtitleFiles,
+              subtitleMode: resolvedSubtitleMode,
+            });
+            processedFiles.push(finalFile);
+          }
+          files = processedFiles;
+        }
+
+        resolve(files);
+      } catch (error) {
+        reject(new Error(`FFmpeg post-processing failed: ${error.message}`));
+      }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on("error", (err) => reject(err));
   });
 }
 

@@ -3,9 +3,9 @@
  * Stores download history as a JSON array.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
+const fs = require("fs");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
 
 /**
  * Get full path to history file
@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require('uuid');
  * @returns {string}
  */
 function getHistoryPath(historyFile) {
-  return path.resolve(process.cwd(), historyFile || './history.json');
+  return path.resolve(process.cwd(), historyFile || "./history.json");
 }
 
 /**
@@ -24,11 +24,11 @@ function getHistoryPath(historyFile) {
 function readHistory(historyFile) {
   const filePath = getHistoryPath(historyFile);
   try {
-    const data = fs.readFileSync(filePath, 'utf8');
+    const data = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(data);
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if (err.code === "ENOENT") {
       return [];
     }
     throw err;
@@ -42,12 +42,12 @@ function readHistory(historyFile) {
  */
 function writeHistory(entries, historyFile) {
   const filePath = getHistoryPath(historyFile);
-  fs.writeFileSync(filePath, JSON.stringify(entries, null, 2), 'utf8');
+  fs.writeFileSync(filePath, JSON.stringify(entries, null, 2), "utf8");
 }
 
 /**
  * Add a new history entry
- * @param {object} entry - { title, url, format, quality, filename, status }
+ * @param {object} entry - { title, url, format, quality, filename, checksum, fileSize, status }
  * @param {string} historyFile - Path to history.json
  * @returns {object} - Entry with id and date added
  */
@@ -55,21 +55,24 @@ function addEntry(entry, historyFile) {
   const entries = readHistory(historyFile);
   const newEntry = {
     id: uuidv4(),
-    title: entry.title || 'Unknown',
-    url: entry.url || '',
-    format: entry.format || 'mp4',
-    quality: entry.quality || 'best',
+    title: entry.title || "Unknown",
+    url: entry.url || "",
+    format: entry.format || "mp4",
+    quality: entry.quality || "best",
     audioBitrate: entry.audioBitrate || null,
     filenameTemplate: entry.filenameTemplate || null,
     subtitleLangs: entry.subtitleLangs || null,
     site: entry.site || null,
     date: new Date().toISOString(),
-    status: entry.status || 'completed',
+    status: entry.status || "completed",
     filename: entry.filename || null,
     // Stored for re-download
     subtitles: entry.subtitles || false,
+    subtitleMode: entry.subtitleMode || "separate",
     removeWatermark: entry.removeWatermark || false,
     isPlaylist: entry.isPlaylist || false,
+    checksum: entry.checksum || null,
+    fileSize: typeof entry.fileSize === "number" ? entry.fileSize : null,
   };
   entries.unshift(newEntry);
   writeHistory(entries, historyFile);
@@ -84,7 +87,7 @@ function addEntry(entry, historyFile) {
  */
 function removeEntry(id, historyFile) {
   const entries = readHistory(historyFile);
-  const filtered = entries.filter(e => e.id !== id);
+  const filtered = entries.filter((e) => e.id !== id);
   if (filtered.length === entries.length) return false;
   writeHistory(filtered, historyFile);
   return true;
