@@ -320,6 +320,80 @@ async function getInfo(url, downloadDir) {
   });
 }
 
+async function getPlaylistEntries(url, downloadDir, limit = 200) {
+  return new Promise((resolve, reject) => {
+    const dir = path.resolve(downloadDir);
+    const maxItems = Math.max(1, Math.min(500, Number(limit) || 200));
+    const args = [
+      "--flat-playlist",
+      "--dump-single-json",
+      "--no-warnings",
+      "--skip-download",
+      "--playlist-end",
+      String(maxItems),
+      url,
+    ];
+
+    const proc = spawn("yt-dlp", args, { cwd: dir });
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(stderr || "Failed to fetch playlist entries"));
+      }
+
+      try {
+        const parsed = JSON.parse(stdout || "{}");
+        const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+        const items = entries
+          .map((entry, index) => {
+            if (!entry) return null;
+            const rawId = entry.id || entry.url || "";
+            let entryUrl =
+              entry.webpage_url || entry.original_url || entry.url || "";
+
+            if (!/^https?:\/\//i.test(entryUrl) && rawId) {
+              if (/youtube/i.test(String(entry.ie_key || ""))) {
+                entryUrl = `https://www.youtube.com/watch?v=${rawId}`;
+              }
+            }
+
+            if (!entryUrl || !/^https?:\/\//i.test(entryUrl)) return null;
+
+            return {
+              id: rawId || `${index + 1}`,
+              url: entryUrl,
+              title: entry.title || `Item ${index + 1}`,
+              uploader: entry.uploader || entry.channel || "",
+              duration: entry.duration || null,
+              thumbnail: entry.thumbnail || null,
+            };
+          })
+          .filter(Boolean);
+
+        resolve({
+          title: parsed.title || "Playlist",
+          uploader: parsed.uploader || parsed.channel || "",
+          totalCount: items.length,
+          items,
+        });
+      } catch (err) {
+        reject(new Error("Failed to parse playlist items"));
+      }
+    });
+
+    proc.on("error", (err) => reject(err));
+  });
+}
+
 /**
  * Build yt-dlp format string based on quality
  * @param {string} quality - 'best' | '1440' | '1080' | '720' | '360'
@@ -389,6 +463,10 @@ async function download({
   startTime,
   endTime,
   limitRate,
+  outputMode,
+  gifFps,
+  gifResolution,
+  compressCrf,
   onProgress,
 }) {
   const site = detectSite(url);
@@ -410,6 +488,10 @@ async function download({
       startTime,
       endTime,
       limitRate,
+      outputMode,
+      gifFps,
+      gifResolution,
+      compressCrf,
       onProgress,
     });
   }
@@ -432,6 +514,10 @@ async function download({
       startTime,
       endTime,
       limitRate,
+      outputMode,
+      gifFps,
+      gifResolution,
+      compressCrf,
       onProgress,
     });
   } catch (error) {
@@ -1321,6 +1407,10 @@ function downloadWithYtDlp({
   startTime,
   endTime,
   limitRate,
+  outputMode,
+  gifFps,
+  gifResolution,
+  compressCrf,
   onProgress,
 }) {
   return new Promise((resolve, reject) => {
@@ -1523,6 +1613,7 @@ function downloadWithYtDlp({
         ".opus",
         ".ogg",
         ".wav",
+        ".gif",
       ];
       const subtitleExts = [".srt", ".vtt", ".ass"];
 
@@ -1583,6 +1674,67 @@ function downloadWithYtDlp({
           files = processedFiles;
         }
 
+        if (outputMode === "gif") {
+          const source = files.find((file) =>
+            [".mp4", ".webm", ".mkv"].includes(
+              path.extname(file).toLowerCase(),
+            ),
+          );
+          if (source) {
+            const fps = Math.max(5, Math.min(30, Number(gifFps) || 15));
+            const width = Math.max(
+              160,
+              Math.min(1280, Number(gifResolution) || 480),
+            );
+            const outputName = `${path.parse(source).name}.gif`;
+            const args = [
+              "-y",
+              "-i",
+              path.join(dir, source),
+              "-vf",
+              `fps=${fps},scale=${width}:-1:flags=lanczos`,
+              "-loop",
+              "0",
+              path.join(dir, outputName),
+            ];
+            await runProcess("ffmpeg", args, dir);
+            files = [outputName];
+          }
+        } else if (outputMode === "compress") {
+          const crf = Math.max(18, Math.min(40, Number(compressCrf) || 28));
+          const compressed = [];
+          for (const file of files) {
+            const ext = path.extname(file).toLowerCase();
+            if (![".mp4", ".webm", ".mkv"].includes(ext)) {
+              compressed.push(file);
+              continue;
+            }
+
+            const outputName = `${path.parse(file).name}.compressed.mp4`;
+            const args = [
+              "-y",
+              "-i",
+              path.join(dir, file),
+              "-c:v",
+              "libx264",
+              "-preset",
+              "medium",
+              "-crf",
+              String(crf),
+              "-c:a",
+              "aac",
+              "-b:a",
+              "128k",
+              "-movflags",
+              "+faststart",
+              path.join(dir, outputName),
+            ];
+            await runProcess("ffmpeg", args, dir);
+            compressed.push(outputName);
+          }
+          files = compressed;
+        }
+
         emitProgress(100, {});
 
         resolve(files);
@@ -1598,6 +1750,7 @@ function downloadWithYtDlp({
 module.exports = {
   detectSite,
   getInfo,
+  getPlaylistEntries,
   download,
   getSpotifyCandidates,
 };

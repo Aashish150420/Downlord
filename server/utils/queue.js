@@ -3,15 +3,25 @@
  * Prevents server overload and handles transient failures
  */
 
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_DOWNLOADS || '2', 10);
-const RETRY_ATTEMPTS = parseInt(process.env.DOWNLOAD_RETRY_ATTEMPTS || '2', 10);
-const RETRY_DELAY_MS = parseInt(process.env.DOWNLOAD_RETRY_DELAY_MS || '3000', 10);
+const DEFAULT_MAX_CONCURRENT = parseInt(
+  process.env.MAX_CONCURRENT_DOWNLOADS || "2",
+  10,
+);
+const RETRY_ATTEMPTS = parseInt(process.env.DOWNLOAD_RETRY_ATTEMPTS || "2", 10);
+const RETRY_DELAY_MS = parseInt(
+  process.env.DOWNLOAD_RETRY_DELAY_MS || "3000",
+  10,
+);
+
+let maxConcurrent = Number.isFinite(DEFAULT_MAX_CONCURRENT)
+  ? Math.max(1, DEFAULT_MAX_CONCURRENT)
+  : 2;
 
 let activeCount = 0;
 const waitQueue = [];
 
 function runNext() {
-  if (activeCount >= MAX_CONCURRENT || waitQueue.length === 0) return;
+  if (activeCount >= maxConcurrent || waitQueue.length === 0) return;
   const job = waitQueue.shift();
   activeCount++;
   job().finally(() => {
@@ -53,7 +63,27 @@ function enqueue(jobFn) {
  * Get current queue status
  */
 function getStatus() {
-  return { active: activeCount, queued: waitQueue.length };
+  return { active: activeCount, queued: waitQueue.length, maxConcurrent };
 }
 
-module.exports = { enqueue, getStatus, MAX_CONCURRENT };
+function setMaxConcurrent(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error("maxConcurrent must be a positive integer");
+  }
+  maxConcurrent = parsed;
+  runNext();
+  return maxConcurrent;
+}
+
+function getMaxConcurrent() {
+  return maxConcurrent;
+}
+
+module.exports = {
+  enqueue,
+  getStatus,
+  setMaxConcurrent,
+  getMaxConcurrent,
+  DEFAULT_MAX_CONCURRENT,
+};

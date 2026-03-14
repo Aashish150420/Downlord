@@ -45,6 +45,7 @@ function parseUrls(body) {
  *         isPlaylist, subtitles, removeWatermark, title(s), reDownload (use history entry) }
  */
 router.post("/", async (req, res) => {
+  const userId = req.user?.id;
   const urls = parseUrls(req.body);
   if (urls.length === 0) {
     return res.status(400).json({ error: "URL or urls array is required" });
@@ -61,12 +62,22 @@ router.post("/", async (req, res) => {
     removeWatermark = false,
     title = "Unknown",
     titles = [], // For batch - array of titles
+    uploader = "",
+    uploaders = [],
+    thumbnail = "",
+    thumbnails = [],
+    presetId = "",
+    presetName = "",
     spotifyYoutubeUrl = "",
     embedSubtitles = false,
     subtitleMode = "separate",
     startTime = "",
     endTime = "",
     limitRate = "",
+    outputMode = "normal",
+    gifFps = 15,
+    gifResolution = 480,
+    compressCrf = 28,
   } = req.body || {};
 
   // Set SSE headers
@@ -89,6 +100,12 @@ router.post("/", async (req, res) => {
         const url = urls[i];
         const itemTitle =
           Array.isArray(titles) && titles[i] ? titles[i] : title;
+        const itemUploader =
+          Array.isArray(uploaders) && uploaders[i] ? uploaders[i] : uploader;
+        const itemThumbnail =
+          Array.isArray(thumbnails) && thumbnails[i]
+            ? thumbnails[i]
+            : thumbnail;
         const total = urls.length;
         let filenames = [];
 
@@ -110,6 +127,10 @@ router.post("/", async (req, res) => {
             startTime: startTime || undefined,
             endTime: endTime || undefined,
             limitRate: limitRate || undefined,
+            outputMode,
+            gifFps,
+            gifResolution,
+            compressCrf,
             onProgress: (percent, meta = {}) => {
               const offset = total > 1 ? (i / total) * 100 : 0;
               const scale = total > 1 ? 100 / total : 100;
@@ -147,6 +168,7 @@ router.post("/", async (req, res) => {
           ".opus",
           ".ogg",
           ".wav",
+          ".gif",
         ];
 
         let mediaFound = 0;
@@ -186,7 +208,12 @@ router.post("/", async (req, res) => {
 
             addEntry(
               {
+                userId,
                 title: itemTitle,
+                uploader: itemUploader || null,
+                thumbnail: itemThumbnail || null,
+                presetId: presetId || null,
+                presetName: presetName || null,
                 url,
                 format,
                 quality,

@@ -13,8 +13,14 @@ const router = express.Router();
 const infoRouter = require("./info");
 const downloadRouter = require("./download");
 const historyRouter = require("./history");
+const { ensureAuthenticated } = require("../middleware/auth");
 const { getSpotifyCandidates } = require("../utils/ytdlp");
 const { readHistory } = require("../utils/history");
+const {
+  getStatus: getQueueStatus,
+  getMaxConcurrent,
+  setMaxConcurrent,
+} = require("../utils/queue");
 
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || "./downloads";
 const HISTORY_FILE = process.env.HISTORY_FILE || "./history.json";
@@ -27,6 +33,40 @@ const LOG_PATH = require("path").join(
   "..",
   "debug-9b862e.log",
 );
+
+function readRecentLogEntries(limit = 200) {
+  if (!fs.existsSync(LOG_PATH)) {
+    return [];
+  }
+
+  return fs
+    .readFileSync(LOG_PATH, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-Math.max(1, limit))
+    .map((line) => {
+      try {
+        const parsed = JSON.parse(line);
+        return {
+          raw: line,
+          timestamp: parsed.timestamp || null,
+          location: parsed.location || null,
+          message: parsed.message || line,
+          data: parsed.data || null,
+          entry: parsed,
+        };
+      } catch {
+        return {
+          raw: line,
+          timestamp: null,
+          location: null,
+          message: line,
+          data: null,
+          entry: null,
+        };
+      }
+    });
+}
 router.use((req, res, next) => {
   const p = req.path || req.url?.split("?")[0] || "";
   try {
@@ -127,6 +167,17 @@ router.get("/health/deps", (req, res) => {
   });
 });
 
+/* ---------- Current user/session ---------- */
+router.get("/me", (req, res) => {
+  if (!req.user) {
+    return res.json({ authenticated: false, user: null });
+  }
+  return res.json({ authenticated: true, user: req.user });
+});
+
+/* ---------- Auth required beyond this point ---------- */
+router.use(ensureAuthenticated);
+
 /* ---------- Info, Download, History ---------- */
 router.use("/info", infoRouter);
 router.use("/download", downloadRouter);
@@ -144,6 +195,38 @@ router.post("/spotify/candidates", async (req, res) => {
   } catch (err) {
     console.error("/api/spotify/candidates error:", err.message);
     res.status(500).json({ error: err.message || "Failed to load candidates" });
+  }
+});
+
+/* ---------- Queue settings ---------- */
+router.get("/queue/status", (req, res) => {
+  try {
+    const status = getQueueStatus();
+    res.json({ ok: true, ...status });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Failed to read queue" });
+  }
+});
+
+router.get("/queue/settings", (req, res) => {
+  try {
+    res.json({ ok: true, maxConcurrent: getMaxConcurrent() });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ error: err.message || "Failed to read queue settings" });
+  }
+});
+
+router.post("/queue/settings", (req, res) => {
+  try {
+    const { maxConcurrent } = req.body || {};
+    const next = setMaxConcurrent(maxConcurrent);
+    res.json({ ok: true, maxConcurrent: next });
+  } catch (err) {
+    res
+      .status(400)
+      .json({ error: err.message || "Failed to update queue settings" });
   }
 });
 
@@ -201,16 +284,28 @@ router.post("/open-downloads", (req, res) => {
 });
 
 /* ---------- Export logs ---------- */
+router.get("/logs/recent", (req, res) => {
+  try {
+    const limit = Number.parseInt(req.query.limit, 10);
+    const entries = readRecentLogEntries(
+      Number.isFinite(limit) ? Math.min(Math.max(limit, 20), 500) : 200,
+    );
+
+    res.json({
+      ok: true,
+      updatedAt: new Date().toISOString(),
+      count: entries.length,
+      entries,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Failed to read logs" });
+  }
+});
+
 router.get("/logs/export", (req, res) => {
   try {
     const history = readHistory(HISTORY_FILE);
-    const debugLog = fs.existsSync(LOG_PATH)
-      ? fs
-          .readFileSync(LOG_PATH, "utf8")
-          .split(/\r?\n/)
-          .filter(Boolean)
-          .slice(-2000)
-      : [];
+    const debugLog = readRecentLogEntries(2000);
 
     const payload = {
       exportedAt: new Date().toISOString(),

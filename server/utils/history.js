@@ -55,6 +55,7 @@ function addEntry(entry, historyFile) {
   const entries = readHistory(historyFile);
   const newEntry = {
     id: uuidv4(),
+    userId: entry.userId || null,
     title: entry.title || "Unknown",
     url: entry.url || "",
     format: entry.format || "mp4",
@@ -63,6 +64,10 @@ function addEntry(entry, historyFile) {
     filenameTemplate: entry.filenameTemplate || null,
     subtitleLangs: entry.subtitleLangs || null,
     site: entry.site || null,
+    uploader: entry.uploader || null,
+    thumbnail: entry.thumbnail || null,
+    presetId: entry.presetId || null,
+    presetName: entry.presetName || null,
     date: new Date().toISOString(),
     status: entry.status || "completed",
     filename: entry.filename || null,
