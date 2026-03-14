@@ -132,6 +132,10 @@ function App() {
   const [spotifyCandidates, setSpotifyCandidates] = useState([]);
   const [spotifyCandidateUrl, setSpotifyCandidateUrl] = useState("");
   const [spotifyCustomUrl, setSpotifyCustomUrl] = useState("");
+  const [spotifyCandidatesLoading, setSpotifyCandidatesLoading] =
+    useState(false);
+  const [spotifyCandidatesLoaded, setSpotifyCandidatesLoaded] = useState(false);
+  const [spotifyShowCount, setSpotifyShowCount] = useState(10);
 
   const [downloadState, setDownloadState] = useState({
     running: false,
@@ -159,6 +163,7 @@ function App() {
 
   const site = info?.site || "unknown";
   const audioOnly = site === "spotify" || site === "soundcloud";
+  const spotifyMode = site === "spotify";
   const subtitlesSupported = site === "youtube";
   const embeddableSubtitles = subtitlesSupported && format === "mp4";
   const canOpenDownloads = isLocalHost && isWindowsClient;
@@ -181,12 +186,25 @@ function App() {
   }, [history]);
 
   const queueBadge = queueStats.active;
+  const recommendedSpotifyCandidate = spotifyCandidates.find(
+    (candidate) => candidate.recommended,
+  );
+  const selectedSpotifyCandidate = spotifyCandidates.find(
+    (candidate) => candidate.url === spotifyCandidateUrl,
+  );
   const qualityOptions =
     Array.isArray(info?.availableQualities) && info.availableQualities.length
       ? info.availableQualities
       : ["best", "1440", "1080", "720", "360"];
+  const spotifySourceReady =
+    !spotifyMode ||
+    spotifyCandidatesLoading ||
+    Boolean(spotifyCustomUrl.trim() || spotifyCandidateUrl);
   const downloadDisabled =
-    downloadState.running || (batchMode ? !batchInput.trim() : !info);
+    downloadState.running ||
+    isFetching ||
+    (batchMode ? !batchInput.trim() : !info) ||
+    !spotifySourceReady;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -375,15 +393,24 @@ function App() {
       }
 
       if (data.site === "spotify") {
+        setFormat("mp3");
+        setSubtitles(false);
+        setSubtitleMode("separate");
+        setSpotifyShowCount(10);
         await loadSpotifyCandidates(targetUrl);
       } else {
         setSpotifyCandidates([]);
         setSpotifyCandidateUrl("");
+        setSpotifyCustomUrl("");
+        setSpotifyCandidatesLoaded(false);
+        setSpotifyCandidatesLoading(false);
       }
     } catch (error) {
       setInfo(null);
       setSpotifyCandidates([]);
       setSpotifyCandidateUrl("");
+      setSpotifyCandidatesLoaded(false);
+      setSpotifyCandidatesLoading(false);
       setUrlError(error.message || "Could not load video info");
       pushToast(error.message || "Could not load video info", "error");
     } finally {
@@ -392,6 +419,8 @@ function App() {
   }
 
   async function loadSpotifyCandidates(trackUrl) {
+    setSpotifyCandidatesLoading(true);
+    setSpotifyCandidatesLoaded(false);
     try {
       const response = await fetch("/api/spotify/candidates", {
         method: "POST",
@@ -404,10 +433,18 @@ function App() {
       }
       const list = Array.isArray(data.candidates) ? data.candidates : [];
       setSpotifyCandidates(list);
-      setSpotifyCandidateUrl("");
+      setSpotifyCandidateUrl(
+        (list.find((candidate) => candidate.recommended) || list[0] || {})
+          .url || "",
+      );
+      setSpotifyCandidatesLoaded(true);
     } catch (error) {
       pushToast(error.message || "Could not load matches", "error");
       setSpotifyCandidates([]);
+      setSpotifyCandidateUrl("");
+      setSpotifyCandidatesLoaded(true);
+    } finally {
+      setSpotifyCandidatesLoading(false);
     }
   }
 
@@ -518,34 +555,55 @@ function App() {
       return;
     }
 
-    const resolvedFormat = overrides.format || format;
+    if (site === "spotify" && !overrides.urls && spotifyCandidatesLoading) {
+      pushToast("Still matching Spotify source. Please wait a moment.", "info");
+      return;
+    }
+
+    if (
+      site === "spotify" &&
+      !overrides.urls &&
+      !spotifyCustomUrl.trim() &&
+      !spotifyCandidateUrl
+    ) {
+      pushToast("Pick a Spotify source match before downloading.", "error");
+      return;
+    }
+
+    const resolvedFormat = spotifyMode ? "mp3" : overrides.format || format;
     const resolvedQuality = overrides.quality || quality;
     const resolvedAudioBitrate =
       overrides.audioBitrate !== undefined
         ? overrides.audioBitrate
         : audioBitrate;
-    const resolvedSubtitleLangs =
-      overrides.subtitleLangs ||
-      subtitleLangs ||
-      pickPreferredSubtitleSelection(info?.subtitleLanguages);
-    const resolvedSubtitleMode =
-      overrides.subtitleMode !== undefined
+    const resolvedSubtitleLangs = spotifyMode
+      ? undefined
+      : overrides.subtitleLangs ||
+        subtitleLangs ||
+        pickPreferredSubtitleSelection(info?.subtitleLanguages);
+    const resolvedSubtitleMode = spotifyMode
+      ? "separate"
+      : overrides.subtitleMode !== undefined
         ? overrides.subtitleMode
         : subtitleMode;
     const resolvedFilenameTemplate =
       overrides.filenameTemplate !== undefined
         ? overrides.filenameTemplate
         : filenameTemplate;
-    const resolvedSubtitles =
-      overrides.subtitles !== undefined ? overrides.subtitles : subtitles;
+    const resolvedSubtitles = spotifyMode
+      ? false
+      : overrides.subtitles !== undefined
+        ? overrides.subtitles
+        : subtitles;
     const resolvedRemoveWatermark =
       overrides.removeWatermark !== undefined
         ? overrides.removeWatermark
         : removeWatermark;
     const resolvedIsPlaylist =
       overrides.isPlaylist !== undefined ? overrides.isPlaylist : isPlaylist;
-    const resolvedEmbedSubtitles =
-      overrides.embedSubtitles !== undefined
+    const resolvedEmbedSubtitles = spotifyMode
+      ? false
+      : overrides.embedSubtitles !== undefined
         ? overrides.embedSubtitles
         : resolvedSubtitleMode !== "separate";
     const resolvedStartTime =
@@ -1158,6 +1216,118 @@ function App() {
                 </p>
               </div>
             </article>`}
+            ${spotifyMode
+              ? html`<section
+                  className="rounded-3xl border border-zinc-800 bg-zinc-950/70 p-4 shadow-panel"
+                >
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <span
+                      className="rounded-full border border-zinc-700 bg-zinc-900 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-300"
+                    >
+                      Spotify match
+                    </span>
+                    <p className="text-xs text-zinc-400">
+                      Pick the best YouTube source before download.
+                    </p>
+                  </div>
+
+                  ${spotifyCandidatesLoading
+                    ? html`<p className="text-sm text-zinc-400">
+                        Finding best matches for this Spotify track...
+                      </p>`
+                    : spotifyCandidates.length === 0 && spotifyCandidatesLoaded
+                      ? html`<p className="text-sm text-amber-300">
+                          No auto matches found. Paste a YouTube URL below to
+                          continue.
+                        </p>`
+                      : null}
+                  ${spotifyCandidates.length > 0
+                    ? html`<div className="space-y-2">
+                          ${spotifyCandidates
+                            .slice(0, spotifyShowCount)
+                            .map((candidate) => {
+                              const active =
+                                spotifyCandidateUrl === candidate.url;
+                              const confidence = String(
+                                candidate.confidence || "low",
+                              );
+                              const confidenceClass =
+                                confidence === "high"
+                                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                                  : confidence === "medium"
+                                    ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                                    : "border-zinc-700 bg-zinc-900/60 text-zinc-300";
+                              return html`<button
+                                key=${candidate.url}
+                                onClick=${() =>
+                                  setSpotifyCandidateUrl(candidate.url)}
+                                className=${`w-full rounded-xl border p-3 text-left transition ${
+                                  active
+                                    ? "border-flux-500 bg-flux-500/10"
+                                    : "border-zinc-800 bg-zinc-900/40 hover:border-zinc-600"
+                                }`}
+                              >
+                                <div
+                                  className="mb-1 flex flex-wrap items-center gap-2"
+                                >
+                                  <span
+                                    className="truncate text-sm font-semibold text-zinc-100"
+                                  >
+                                    ${candidate.title || "Untitled"}
+                                  </span>
+                                  ${candidate.recommended
+                                    ? html`<span
+                                        className="rounded-full border border-flux-500/40 bg-flux-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-flux-100"
+                                        >recommended</span
+                                      >`
+                                    : null}
+                                  <span
+                                    className=${`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${confidenceClass}`}
+                                  >
+                                    ${confidence}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-zinc-400">
+                                  ${candidate.uploader || "Unknown"} ·
+                                  ${formatDuration(candidate.duration)} · score
+                                  ${candidate.score ?? "—"}
+                                  ${candidate.durationDiff != null
+                                    ? ` · Δ ${candidate.durationDiff}s`
+                                    : ""}
+                                </p>
+                              </button>`;
+                            })}
+                        </div>
+                        ${spotifyShowCount < spotifyCandidates.length
+                          ? html`<button
+                              onClick=${() =>
+                                setSpotifyShowCount((prev) =>
+                                  Math.min(prev + 10, spotifyCandidates.length),
+                                )}
+                              className="mt-3 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-zinc-200 hover:border-zinc-500"
+                            >
+                              Show more matches
+                              (${spotifyCandidates.length - spotifyShowCount}
+                              left)
+                            </button>`
+                          : null}`
+                    : null}
+
+                  <div className="mt-3">
+                    <label
+                      className="mb-1 block text-xs uppercase tracking-[0.15em] text-zinc-500"
+                      >Manual YouTube URL override</label
+                    >
+                    <input
+                      value=${spotifyCustomUrl}
+                      onInput=${(event) =>
+                        setSpotifyCustomUrl(event.target.value)}
+                      placeholder="https://www.youtube.com/watch?v=..."
+                      className="h-10 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100"
+                    />
+                  </div>
+                </section>`
+              : null}
 
             <button
               onClick=${() => startDownload()}
@@ -1181,7 +1351,13 @@ function App() {
                       <span>${downloadState.itemPercent}%</span>`
                   : downloadState.done
                     ? "Done"
-                    : "Start download"}
+                    : spotifyMode && spotifyCandidatesLoading
+                      ? "Matching source..."
+                      : spotifyMode &&
+                          !spotifyCustomUrl.trim() &&
+                          !spotifyCandidateUrl
+                        ? "Select source first"
+                        : "Start download"}
               </span>
             </button>
 
@@ -1233,7 +1409,7 @@ function App() {
                   >Format</label
                 >
                 <div className="grid grid-cols-2 gap-2">
-                  ${["mp4", "mp3"].map(
+                  ${(spotifyMode ? ["mp3"] : ["mp4", "mp3"]).map(
                     (item) =>
                       html`<button
                         key=${item}
@@ -1251,6 +1427,12 @@ function App() {
                       </button>`,
                   )}
                 </div>
+                ${spotifyMode
+                  ? html`<p className="mt-2 text-xs text-zinc-500">
+                      Spotify is audio-only here. We resolve the track to a
+                      matching YouTube audio source.
+                    </p>`
+                  : null}
               </div>
 
               ${!audioOnly &&
@@ -1329,41 +1511,6 @@ function App() {
                     className="mt-3 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100"
                   ></textarea>`}
                 </div>
-
-                ${spotifyCandidates.length > 0 &&
-                html`<div
-                  className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-3"
-                >
-                  <p
-                    className="mb-2 text-xs uppercase tracking-[0.15em] text-zinc-500"
-                  >
-                    Source matching
-                  </p>
-                  <select
-                    value=${spotifyCandidateUrl}
-                    onChange=${(event) =>
-                      setSpotifyCandidateUrl(event.target.value)}
-                    className="mb-2 h-10 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100"
-                  >
-                    <option value="">Auto (best match)</option>
-                    ${spotifyCandidates.map(
-                      (candidate) =>
-                        html`<option
-                          key=${candidate.url}
-                          value=${candidate.url}
-                        >
-                          ${`${candidate.title || "Untitled"} — ${candidate.uploader || "Unknown"}${candidate.duration ? ` (${formatDuration(candidate.duration)})` : ""}`}
-                        </option>`,
-                    )}
-                  </select>
-                  <input
-                    value=${spotifyCustomUrl}
-                    onInput=${(event) =>
-                      setSpotifyCustomUrl(event.target.value)}
-                    placeholder="Manual YouTube URL override"
-                    className="h-10 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100"
-                  />
-                </div>`}
 
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
                   ${format === "mp3" &&

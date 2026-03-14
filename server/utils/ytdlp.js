@@ -151,6 +151,41 @@ function normalizeSpotifyUrl(url) {
   return url;
 }
 
+const SPOTIFY_API_BLOCK_MS = 6 * 60 * 60 * 1000;
+let spotifyApiBlockedUntil = 0;
+
+function splitArtistTokens(value) {
+  return String(value || "")
+    .split(/,|&|\bx\b|\bfeat\.?\b|\bft\.?\b/gi)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseSpotifyOEmbedMeta(title, author) {
+  const cleanedTitle = String(title || "")
+    .replace(/\s*\|\s*spotify.*$/i, "")
+    .trim();
+  const cleanedAuthor = String(author || "").trim();
+
+  if (!cleanedTitle && !cleanedAuthor) {
+    return { title: "", artists: [] };
+  }
+
+  const byMatch = cleanedTitle.match(/^(.+?)\s+by\s+(.+)$/i);
+  if (byMatch) {
+    return {
+      title: byMatch[1].trim(),
+      artists: splitArtistTokens(byMatch[2]),
+    };
+  }
+
+  const isGenericAuthor = /^(spotify|unknown)$/i.test(cleanedAuthor);
+  return {
+    title: cleanedTitle,
+    artists: isGenericAuthor ? [] : splitArtistTokens(cleanedAuthor),
+  };
+}
+
 /**
  * Fetch video/audio metadata via yt-dlp --dump-json
  * For Spotify, returns basic info (spotDL doesn't support metadata-only)
@@ -355,18 +390,19 @@ async function download({
   const site = detectSite(url);
 
   if (site === "spotify") {
+    const forcedFormat = "mp3";
     return downloadSpotifyViaYoutube({
       url,
-      format,
+      format: forcedFormat,
       quality,
       audioBitrate,
       filenameTemplate,
-      subtitleLangs,
+      subtitleLangs: undefined,
       isPlaylist,
       spotifyYoutubeUrl,
       downloadDir,
-      embedSubtitles,
-      subtitleMode,
+      embedSubtitles: false,
+      subtitleMode: "separate",
       startTime,
       endTime,
       limitRate,
@@ -510,9 +546,22 @@ async function downloadSpotifyViaYoutube({
   try {
     oembedInfo = await getInfo(url, downloadDir);
     if (!query && oembedInfo && oembedInfo.title) {
-      query = oembedInfo.uploader
-        ? `${oembedInfo.title} ${oembedInfo.uploader}`
-        : oembedInfo.title;
+      const parsed = parseSpotifyOEmbedMeta(
+        oembedInfo.title,
+        oembedInfo.uploader,
+      );
+      if (!spotifyTitle && parsed.title) {
+        spotifyTitle = parsed.title;
+      }
+      if (
+        (!spotifyArtists || spotifyArtists.length === 0) &&
+        parsed.artists.length
+      ) {
+        spotifyArtists = parsed.artists;
+      }
+      query = parsed.artists.length
+        ? `${parsed.title} ${parsed.artists.join(" ")}`.trim()
+        : parsed.title || oembedInfo.title;
     }
   } catch (_) {
     // fall through – we will just search by normalized URL
@@ -591,7 +640,7 @@ async function findBestYoutubeMatchForSpotify({
   durationSec,
   downloadDir,
 }) {
-  const searchQuery = `ytsearch10:${query}`;
+  const searchQuery = `ytsearch30:${query}`;
   return new Promise((resolve, reject) => {
     const args = ["--dump-json", "--no-download", searchQuery];
     const proc = spawn("yt-dlp", args, {
@@ -654,10 +703,16 @@ async function getSpotifyCandidates(url, downloadDir) {
   if (site !== "spotify") return [];
 
   let query = "";
+  let spotifyTitle = "";
+  let spotifyArtists = [];
+  let spotifyDurationSec = null;
 
   try {
     const meta = await getSpotifyTrackMetadata(url);
     if (meta && meta.title) {
+      spotifyTitle = meta.title || "";
+      spotifyArtists = meta.artists || [];
+      spotifyDurationSec = meta.durationSec || null;
       query = meta.artists?.length
         ? `${meta.title} ${meta.artists.join(" ")}`
         : meta.title;
@@ -668,13 +723,20 @@ async function getSpotifyCandidates(url, downloadDir) {
     try {
       const info = await getInfo(url, downloadDir);
       if (info && info.title) {
-        query = info.uploader ? `${info.title} ${info.uploader}` : info.title;
+        const parsed = parseSpotifyOEmbedMeta(info.title, info.uploader);
+        spotifyTitle = parsed.title || info.title || spotifyTitle;
+        if (parsed.artists.length) {
+          spotifyArtists = parsed.artists;
+        }
+        query = parsed.artists.length
+          ? `${spotifyTitle} ${parsed.artists.join(" ")}`.trim()
+          : spotifyTitle;
       }
     } catch (_) {}
   }
 
   const normalizedUrl = normalizeSpotifyUrl(url);
-  const searchQuery = query ? `ytsearch10:${query}` : normalizedUrl;
+  const searchQuery = query ? `ytsearch30:${query}` : normalizedUrl;
 
   return new Promise((resolve, reject) => {
     const args = ["--dump-json", "--no-download", searchQuery];
@@ -696,12 +758,42 @@ async function getSpotifyCandidates(url, downloadDir) {
       try {
         const lines = stdout.trim().split("\n").filter(Boolean);
         const results = lines.map((line) => JSON.parse(line));
-        const candidates = results.map((r) => ({
-          url: r.webpage_url || r.url,
-          title: r.title || "",
-          uploader: r.uploader || r.channel || "",
-          duration: r.duration || null,
-        }));
+
+        const artistCombined = (spotifyArtists || []).join(" ");
+        const artistNorm = normalizeForMatch(artistCombined);
+        const hasStrongArtistCandidate =
+          !!artistNorm &&
+          results.some((r) => {
+            const ytTitle = normalizeForMatch(r.title || "");
+            const ytChannel = normalizeForMatch(r.uploader || r.channel || "");
+            return (
+              ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm)
+            );
+          });
+
+        const ranked = rankYoutubeResultsForSpotify(
+          results,
+          spotifyTitle || "",
+          artistCombined,
+          spotifyDurationSec,
+          hasStrongArtistCandidate,
+        );
+
+        const candidates = ranked.map((item, index) => {
+          const r = item.raw;
+          return {
+            url: r.webpage_url || r.url,
+            title: r.title || "",
+            uploader: r.uploader || r.channel || "",
+            duration: r.duration || null,
+            score: item.score,
+            confidence: item.confidence,
+            hasArtistMatch: item.hasArtistMatch,
+            durationDiff: item.durationDiff,
+            recommended: index === 0,
+          };
+        });
+
         if (candidates.length > 0) {
           // Even if yt-dlp exited with non-zero due to warnings, return whatever we parsed.
           if (code !== 0) {
@@ -737,7 +829,13 @@ function normalizeForMatch(str) {
     .trim();
 }
 
-function scoreBestYoutubeResult(
+function classifySpotifyMatchConfidence(score) {
+  if (score >= 16) return "high";
+  if (score >= 8) return "medium";
+  return "low";
+}
+
+function rankYoutubeResultsForSpotify(
   results,
   spotifyTitle,
   spotifyArtist,
@@ -758,70 +856,134 @@ function scoreBestYoutubeResult(
     "cover",
     "edit",
     "version",
+    "playlist",
+    "mix",
+    "compilation",
+    "hour",
+    "loop",
+    "nightcore",
+    "karaoke",
+    "reaction",
+    "podcast",
+    "interview",
+    "full album",
+    "trending",
+    "hits",
+    "best of",
+    "2026",
+    "2025",
   ];
 
-  let best = null;
-  let bestScore = -Infinity;
+  const goodWords = [
+    "official audio",
+    "audio",
+    "topic",
+    "provided to youtube",
+    "lyric video",
+  ];
+
+  const ranked = [];
 
   for (const r of results) {
     const ytTitle = normalizeForMatch(r.title || "");
     const ytChannel = normalizeForMatch(r.uploader || r.channel || "");
+    const ytCombined = `${ytTitle} ${ytChannel}`;
 
     let score = 0;
 
-    // Reward title token overlap
+    if (titleNorm && ytTitle.includes(titleNorm)) score += 14;
+    else if (titleNorm && ytCombined.includes(titleNorm)) score += 10;
+
+    if (titleNorm && ytTitle.startsWith(titleNorm)) score += 3;
+
     for (const t of titleTokens) {
       if (ytTitle.includes(t)) score += 2;
+      else if (ytChannel.includes(t)) score += 1;
     }
 
-    // Reward artist matches in title or channel
     if (artistNorm) {
       if (ytTitle.includes(artistNorm)) score += 4;
       if (ytChannel.includes(artistNorm)) score += 6;
+
+      const splitArtists = artistNorm.split(" ").filter(Boolean);
+      for (const token of splitArtists) {
+        if (token.length < 3) continue;
+        if (ytTitle.includes(token)) score += 1;
+        if (ytChannel.includes(token)) score += 2;
+      }
     }
 
-    // Penalize bad words if they are not in the Spotify title
     for (const w of badWords) {
       const inYtTitle = ytTitle.includes(w);
       const inSpotifyTitle = titleNorm.includes(w);
-      if (inYtTitle && !inSpotifyTitle) score -= 5;
+      if (inYtTitle && !inSpotifyTitle) score -= 6;
     }
 
-    // Prefer medium-length videos (not 1h compilations or 5s clips)
+    for (const w of goodWords) {
+      if (ytCombined.includes(w)) score += 2;
+    }
+
+    if (/\b(official|vevo)\b/.test(ytChannel)) {
+      score += 3;
+    }
+
+    if (/\bshorts\b/.test(ytCombined)) {
+      score -= 8;
+    }
+
     const dur = r.duration || 0;
     if (dur > 0) {
       if (dur < 60 || dur > 600) score -= 3;
       else score += 2;
 
-      // Strongly reward matches close to the Spotify track duration
       if (spotifyDurationSec) {
         const diff = Math.abs(dur - spotifyDurationSec);
-        if (diff <= 3)
-          score += 10; // very close match
-        else if (diff <= 8)
-          score += 6; // reasonably close
-        else if (diff >= 20) score -= 6; // way off
-      }
-
-      // If we have at least one strong artist candidate, heavily penalize results
-      // that don't mention the artist in title or channel. This helps avoid
-      // very popular songs with the same title but different artist.
-      if (preferArtistStrict && artistNorm) {
-        const hasArtist =
-          ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm);
-        if (!hasArtist) {
-          score -= 20;
-        }
+        if (diff <= 3) score += 10;
+        else if (diff <= 8) score += 6;
+        else if (diff <= 15) score += 2;
+        else if (diff >= 20) score -= 6;
+        if (diff >= 45) score -= 10;
       }
     }
 
-    if (score > bestScore) {
-      bestScore = score;
-      best = r;
+    if (preferArtistStrict && artistNorm) {
+      const hasArtist =
+        ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm);
+      if (!hasArtist) score -= 20;
     }
+
+    ranked.push({
+      raw: r,
+      score,
+      confidence: classifySpotifyMatchConfidence(score),
+      hasArtistMatch:
+        !!artistNorm &&
+        (ytTitle.includes(artistNorm) || ytChannel.includes(artistNorm)),
+      durationDiff:
+        spotifyDurationSec && r.duration
+          ? Math.abs((r.duration || 0) - spotifyDurationSec)
+          : null,
+    });
   }
 
-  return best;
+  return ranked.sort((a, b) => b.score - a.score);
+}
+
+function scoreBestYoutubeResult(
+  results,
+  spotifyTitle,
+  spotifyArtist,
+  spotifyDurationSec,
+  preferArtistStrict,
+) {
+  const ranked = rankYoutubeResultsForSpotify(
+    results,
+    spotifyTitle,
+    spotifyArtist,
+    spotifyDurationSec,
+    preferArtistStrict,
+  );
+  return ranked.length ? ranked[0].raw : null;
 }
 
 /**
@@ -836,6 +998,7 @@ async function getSpotifyTrackMetadata(url) {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
   if (!clientId || !clientSecret) return null;
+  if (Date.now() < spotifyApiBlockedUntil) return null;
 
   try {
     const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
@@ -849,7 +1012,7 @@ async function getSpotifyTrackMetadata(url) {
     });
     if (!tokenRes.ok) {
       const text = await tokenRes.text();
-      console.error(
+      console.warn(
         "[Spotify meta] token error",
         tokenRes.status,
         text.slice(0, 200),
@@ -870,11 +1033,20 @@ async function getSpotifyTrackMetadata(url) {
     );
     if (!trackRes.ok) {
       const text = await trackRes.text();
-      console.error(
-        "[Spotify meta] track error",
-        trackRes.status,
-        text.slice(0, 200),
-      );
+      const snippet = text.slice(0, 200);
+      if (
+        trackRes.status === 403 &&
+        /active premium subscription required|premium subscription required/i.test(
+          snippet,
+        )
+      ) {
+        spotifyApiBlockedUntil = Date.now() + SPOTIFY_API_BLOCK_MS;
+        console.warn(
+          "[Spotify meta] Track API access blocked by Spotify app subscription policy; using oEmbed fallback.",
+        );
+        return null;
+      }
+      console.warn("[Spotify meta] track error", trackRes.status, snippet);
       return null;
     }
     const track = await trackRes.json();
