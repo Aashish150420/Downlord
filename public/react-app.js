@@ -2921,7 +2921,7 @@ function App() {
             </div>`
           : null}
         ${tab === "download" &&
-        html`<section className="mx-auto flex max-w-[660px] flex-col gap-4">
+        html`<section className="flex w-full flex-col gap-4">
           <div className="space-y-5">
             <div
               className="rounded-3xl border border-zinc-800 bg-zinc-950/70 p-5 shadow-panel"
