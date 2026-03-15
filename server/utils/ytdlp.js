@@ -1294,8 +1294,13 @@ async function ensureCompatibleMp4({
     resolvedSubtitleMode === "soft" && existingSubtitleFiles.length > 0;
   const shouldHardEmbed =
     resolvedSubtitleMode === "hard" && existingSubtitleFiles.length > 0;
-  const needsVideoTranscode = true;
   let hardBurnTempSubtitle = null;
+
+  // In the common case (already mp4 + separate subtitles), skip a costly
+  // re-encode pass and keep the original file as-is.
+  if (!shouldSoftEmbed && !shouldHardEmbed && sourceExt === ".mp4") {
+    return mediaFile;
+  }
 
   if (shouldSoftEmbed) {
     existingSubtitleFiles.forEach((subtitleFile) => {
@@ -1425,16 +1430,17 @@ function downloadWithYtDlp({
     const requestedSubtitleMode =
       subtitleMode || (embedSubtitles ? "soft" : "separate");
     const resolvedSubtitleMode =
-      process.env.NODE_ENV === "production" && requestedSubtitleMode === "hard"
-        ? "soft"
+      process.env.NODE_ENV === "production" &&
+      requestedSubtitleMode !== "separate"
+        ? "separate"
         : requestedSubtitleMode;
 
     if (
       process.env.NODE_ENV === "production" &&
-      requestedSubtitleMode === "hard"
+      requestedSubtitleMode !== "separate"
     ) {
       console.warn(
-        "[ffmpeg] Hard-burn subtitles requested in production; using soft subtitles to improve reliability.",
+        "[ffmpeg] Subtitle embedding requested in production; using separate subtitle files to improve reliability.",
       );
     }
 
