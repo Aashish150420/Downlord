@@ -1422,8 +1422,21 @@ function downloadWithYtDlp({
       : "%(title)s - %(uploader)s.%(ext)s";
     const baseTemplate = sanitizeTemplate(filenameTemplate) || defaultTemplate;
     const outputTemplate = path.join(dir, baseTemplate);
-    const resolvedSubtitleMode =
+    const requestedSubtitleMode =
       subtitleMode || (embedSubtitles ? "soft" : "separate");
+    const resolvedSubtitleMode =
+      process.env.NODE_ENV === "production" && requestedSubtitleMode === "hard"
+        ? "soft"
+        : requestedSubtitleMode;
+
+    if (
+      process.env.NODE_ENV === "production" &&
+      requestedSubtitleMode === "hard"
+    ) {
+      console.warn(
+        "[ffmpeg] Hard-burn subtitles requested in production; using soft subtitles to improve reliability.",
+      );
+    }
 
     const args = [
       "-o",
